@@ -23,5 +23,5 @@ def move_file(hook: S3Hook, src_bucket, dest_bucket, key, dest_key=None, delete_
 
         return True
     except Exception as e:
-        logging.error(f"❌ Failed to move {key}: {e}")
+        logging.error(f" Failed to move {key}: {e}")
         return False

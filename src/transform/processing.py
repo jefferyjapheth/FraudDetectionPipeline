@@ -1,6 +1,7 @@
 import logging
 from typing import List, Dict
-from src.config.settings import STAGING_BUCKET
+from src.config.settings import MASTER_DATA_BUCKET
+
 
 def process_file_batch(file_batch: List[Dict]) -> List[Dict]:
     if not file_batch:
@@ -23,7 +24,7 @@ def process_file_batch(file_batch: List[Dict]) -> List[Dict]:
         processed_path = f"processed_{file_path}"
 
         try:
-            logging.info(f"Processing file: {STAGING_BUCKET}/{file_path} (batch: {batch_id})")
+            logging.info(f"Processing file: {MASTER_DATA_BUCKET}/{file_path} (batch: {batch_id})")
 
             processed.append({
                 "original_path": {"file": file_path, "batch_id": batch_id},

@@ -1,8 +1,7 @@
 """
-ghana_fraud_simulator_raw_travel_s3_env.py
-
-Simulates raw credit card transaction data for Ghana and uploads to MinIO/S3.
-Generates metadata JSON (including batch IDs) with all uploaded file paths for Airflow validation.
+ghana_fraud_simulator_scd2.py
+Enhanced Ghana Fraud Simulator with SCD Type 2–ready seeds and auto-archiving.
+Simulates customer/terminal evolution over time and uploads raw data to S3.
 """
 
 import os
@@ -16,6 +15,8 @@ import numpy as np
 import boto3
 from botocore.exceptions import ClientError
 from datetime import datetime
+from pathlib import Path
+import argparse
 
 # -----------------------------
 # Ghana Regions & Cities
@@ -54,11 +55,98 @@ def compute_average_region_distances():
 
 
 # -----------------------------
+# Seed Archiving Utility
+# -----------------------------
+def archive_old_seed(seed_path: Path):
+    """Archive existing seed file to a dated folder before overwriting."""
+    if seed_path.exists():
+        archive_dir = seed_path.parent / "archive" / datetime.utcnow().strftime("%Y%m%d")
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.utcnow().strftime("%H%M%S")
+        archived_name = f"{seed_path.stem}_{timestamp}.csv"
+        archived_path = archive_dir / archived_name
+        shutil.move(seed_path, archived_path)
+        print(f"🗄️ Archived old seed to {archived_path}")
+
+
+# -----------------------------
+# Seed Persistence & Evolution
+# -----------------------------
+def evolve_customers(customers, evolve_prob=0.1):
+    """Randomly evolve a small subset of customers (simulate SCD2 changes)."""
+    updated = []
+    for _, row in customers.iterrows():
+        if random.random() < evolve_prob:
+            city_info = random.choice(GHANA_CITIES)
+            new_row = row.copy()
+            new_row["version"] += 1
+            new_row["effective_date"] = datetime.utcnow().isoformat()
+            new_row["HOME_CITY"] = city_info["city"]
+            new_row["HOME_REGION"] = city_info["region"]
+            new_row["x_customer_id"] = city_info["x"] + np.random.normal(0, 5)
+            new_row["y_customer_id"] = city_info["y"] + np.random.normal(0, 5)
+            new_row["mean_amount"] = np.random.uniform(10, 200)
+            new_row["std_amount"] = new_row["mean_amount"] / 2
+            updated.append(new_row)
+    if updated:
+        customers = pd.concat([customers, pd.DataFrame(updated)], ignore_index=True)
+    return customers
+
+
+def evolve_terminals(terminals, evolve_prob=0.05):
+    """Randomly evolve some terminals (simulate relocations)."""
+    updated = []
+    for _, row in terminals.iterrows():
+        if random.random() < evolve_prob:
+            city_info = random.choice(GHANA_CITIES)
+            new_row = row.copy()
+            new_row["version"] += 1
+            new_row["effective_date"] = datetime.utcnow().isoformat()
+            new_row["CITY"] = city_info["city"]
+            new_row["REGION"] = city_info["region"]
+            new_row["x_terminal_id"] = city_info["x"] + np.random.normal(0, 5)
+            new_row["y_terminal_id"] = city_info["y"] + np.random.normal(0, 5)
+            updated.append(new_row)
+    if updated:
+        terminals = pd.concat([terminals, pd.DataFrame(updated)], ignore_index=True)
+    return terminals
+
+
+def load_or_generate_customers(n_customers, seed_dir="data/seeds", reset=False):
+    os.makedirs(seed_dir, exist_ok=True)
+    seed_path = Path(seed_dir) / "customers_seed.csv"
+    if not reset and seed_path.exists():
+        customers = pd.read_csv(seed_path)
+        customers = evolve_customers(customers)
+    else:
+        if seed_path.exists():
+            archive_old_seed(seed_path)
+        customers = generate_customers(n_customers)
+    customers.to_csv(seed_path, index=False)
+    return customers
+
+
+def load_or_generate_terminals(n_terminals, seed_dir="data/seeds", reset=False):
+    os.makedirs(seed_dir, exist_ok=True)
+    seed_path = Path(seed_dir) / "terminals_seed.csv"
+    if not reset and seed_path.exists():
+        terminals = pd.read_csv(seed_path)
+        terminals = evolve_terminals(terminals)
+    else:
+        if seed_path.exists():
+            archive_old_seed(seed_path)
+        terminals = generate_terminals(n_terminals)
+    terminals.to_csv(seed_path, index=False)
+    return terminals
+
+
+# -----------------------------
 # Generators
 # -----------------------------
 def generate_customers(n_customers=500, seed=0):
     np.random.seed(seed)
     customers = []
+    now = datetime.utcnow().isoformat()
     for i in range(n_customers):
         city_info = random.choice(GHANA_CITIES)
         mean_amount = np.random.uniform(10, 200)
@@ -72,7 +160,9 @@ def generate_customers(n_customers=500, seed=0):
             "y_customer_id": city_info["y"] + np.random.normal(0, 5),
             "mean_amount": mean_amount,
             "std_amount": std_amount,
-            "mean_nb_tx_per_day": mean_tx_day
+            "mean_nb_tx_per_day": mean_tx_day,
+            "version": 1,
+            "effective_date": now
         })
     return pd.DataFrame(customers)
 
@@ -80,6 +170,7 @@ def generate_customers(n_customers=500, seed=0):
 def generate_terminals(n_terminals=1000, seed=1):
     np.random.seed(seed)
     terminals = []
+    now = datetime.utcnow().isoformat()
     for i in range(n_terminals):
         city_info = random.choice(GHANA_CITIES)
         terminals.append({
@@ -88,6 +179,8 @@ def generate_terminals(n_terminals=1000, seed=1):
             "REGION": city_info["region"],
             "x_terminal_id": city_info["x"] + np.random.normal(0, 5),
             "y_terminal_id": city_info["y"] + np.random.normal(0, 5),
+            "version": 1,
+            "effective_date": now
         })
     return pd.DataFrame(terminals)
 
@@ -105,12 +198,8 @@ def generate_customer_travel_profiles(customers, avg_region_distances, max_regio
     return pd.DataFrame(profiles)
 
 
-# -----------------------------
-# Transactions
-# -----------------------------
-def generate_transactions(customers, terminals, avg_region_distances,
-                          travel_profiles, window_minutes=60,
-                          p_high_amount=0.05):
+def generate_transactions(customers, terminals, avg_region_distances, travel_profiles,
+                          window_minutes=60, p_high_amount=0.05):
     tx_list = []
     now = pd.Timestamp.now()
     window_seconds = window_minutes * 60
@@ -124,15 +213,12 @@ def generate_transactions(customers, terminals, avg_region_distances,
             tx_dt = now - pd.Timedelta(seconds=int(np.random.uniform(0, window_seconds)))
             terminal = terminals.sample(1).iloc[0]
             amount = max(0.1, np.random.normal(cust["mean_amount"], cust["std_amount"]))
-
             if random.random() < p_high_amount:
                 amount *= np.random.uniform(3, 8)
-
             dist_km = round(haversine_distance(
                 cust["x_customer_id"], cust["y_customer_id"],
                 terminal["x_terminal_id"], terminal["y_terminal_id"]
             ), 2)
-
             is_new_region = 0 if terminal["REGION"] in allowed_regions else 1
 
             tx_list.append({
@@ -154,7 +240,7 @@ def generate_transactions(customers, terminals, avg_region_distances,
 
 
 # -----------------------------
-# MinIO/S3 helpers
+# S3 / Save / Metadata
 # -----------------------------
 def init_s3_client():
     config = {
@@ -163,7 +249,6 @@ def init_s3_client():
         "secret_key": os.getenv("MINIO_PASSWORD", "password"),
         "bucket": os.getenv("MINIO_BUCKET_RAW", "raw-data"),
     }
-
     s3_client = boto3.client(
         "s3",
         endpoint_url=config["endpoint"],
@@ -178,15 +263,12 @@ def ensure_bucket(s3_client, bucket_name: str):
     try:
         s3_client.head_bucket(Bucket=bucket_name)
     except ClientError as e:
-        if e.response['Error']['Code'] in ['404', 'NoSuchBucket']:
+        if e.response["Error"]["Code"] in ["404", "NoSuchBucket"]:
             s3_client.create_bucket(Bucket=bucket_name)
         else:
             raise e
 
 
-# -----------------------------
-# Save Helper + Metadata
-# -----------------------------
 def record_metadata(uploaded_files, batch_id, output_dir="data/raw_batches", upload_to_s3=False):
     os.makedirs(output_dir, exist_ok=True)
     metadata = {
@@ -194,88 +276,69 @@ def record_metadata(uploaded_files, batch_id, output_dir="data/raw_batches", upl
         "generated_at": datetime.utcnow().isoformat(),
         "files": uploaded_files
     }
-
     metadata_filename = f"metadata_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
     metadata_path = os.path.join(output_dir, metadata_filename)
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
-
-    latest_path = os.path.join(output_dir, "metadata_latest.json")
-    shutil.copy(metadata_path, latest_path)
-    print(f"✅ Metadata written to {metadata_path}")
+    shutil.copy(metadata_path, os.path.join(output_dir, "metadata_latest.json"))
+    print(f" Metadata written to {metadata_path}")
 
     if upload_to_s3:
         s3_client, bucket = init_s3_client()
         ensure_bucket(s3_client, bucket)
         s3_client.upload_file(metadata_path, bucket, f"metadata/{os.path.basename(metadata_path)}")
-        s3_client.upload_file(latest_path, bucket, "metadata/metadata_latest.json")
+        s3_client.upload_file(os.path.join(output_dir, "metadata_latest.json"), bucket, "metadata/metadata_latest.json")
         print(f"Uploaded metadata files to s3://{bucket}/metadata/")
-
     return metadata_path
 
 
 def save_entity(df, name, prefix, out_dir="data/raw_batches", upload_to_s3=False, uploaded_files=None):
     os.makedirs(os.path.join(out_dir, prefix), exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{name}_{timestamp}.csv"
+    filename = f"{name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     path = os.path.join(out_dir, prefix, filename)
     df.to_csv(path, index=False)
-
     s3_path = None
     if upload_to_s3:
         s3_client, bucket = init_s3_client()
         ensure_bucket(s3_client, bucket)
         s3_client.upload_file(path, bucket, f"{prefix}/{filename}")
         s3_path = f"s3://{bucket}/{prefix}/{filename}"
-
     if uploaded_files is not None:
-        uploaded_files.append({
-            "type": prefix,
-            "local_path": path,
-            "s3_path": s3_path or "N/A",
-            "rows": len(df),
-            "batch_id": None
-        })
+        uploaded_files.append({"type": prefix, "local_path": path, "s3_path": s3_path or "N/A", "rows": len(df)})
 
 
-def save_batches(df, batch_size=5000, prefix="transactions",
-                 out_dir="data/raw_batches", upload_to_s3=False, uploaded_files=None, batch_id=None):
+def save_batches(df, batch_size=5000, prefix="transactions", out_dir="data/raw_batches",
+                 upload_to_s3=False, uploaded_files=None, batch_id=None):
     os.makedirs(os.path.join(out_dir, prefix), exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     s3_client, bucket = (init_s3_client() if upload_to_s3 else (None, None))
     if upload_to_s3 and bucket:
         ensure_bucket(s3_client, bucket)
-
     for i, start in enumerate(range(0, len(df), batch_size), start=1):
         batch = df.iloc[start:start + batch_size]
         filename = f"{prefix}_{timestamp}_batch_{i:03d}.csv"
         path = os.path.join(out_dir, prefix, filename)
         batch.to_csv(path, index=False)
-
         s3_path = None
         if upload_to_s3 and bucket:
             s3_client.upload_file(path, bucket, f"{prefix}/{filename}")
             s3_path = f"s3://{bucket}/{prefix}/{filename}"
-
         if uploaded_files is not None:
             uploaded_files.append({
-                "type": prefix,
-                "local_path": path,
+                "type": prefix, "local_path": path,
                 "s3_path": s3_path or "N/A",
-                "rows": len(batch),
-                "batch_id": batch_id,
-                "batch_num": i
+                "rows": len(batch), "batch_id": batch_id, "batch_num": i
             })
 
 
 # -----------------------------
 # Main
 # -----------------------------
-def main():
-    n_customers = random.randint(800, 1900)
-    n_terminals = random.randint(1200, 2700)
+def main(reset_seed=False):
+    n_customers = random.randint(10, 60)
+    n_terminals = random.randint(5, 50)
     window_minutes = 15
-    batch_size = 1000
+    batch_size = 20
     out_dir = "data/raw_batches"
     upload_to_s3 = True
 
@@ -284,23 +347,25 @@ def main():
     print(f"Generating {n_customers} customers and {n_terminals} terminals...")
 
     avg_region_distances = compute_average_region_distances()
-    customers = generate_customers(n_customers)
-    terminals = generate_terminals(n_terminals)
+    customers = load_or_generate_customers(n_customers, reset=reset_seed)
+    terminals = load_or_generate_terminals(n_terminals, reset=reset_seed)
     travel_profiles = generate_customer_travel_profiles(customers, avg_region_distances)
     transactions = generate_transactions(customers, terminals, avg_region_distances, travel_profiles,
                                          window_minutes=window_minutes)
 
     uploaded_files = []
-
     save_entity(customers, "customers", "customers", out_dir, upload_to_s3, uploaded_files)
     save_entity(terminals, "terminals", "terminals", out_dir, upload_to_s3, uploaded_files)
     save_entity(travel_profiles, "travel_profiles", "travel_profiles", out_dir, upload_to_s3, uploaded_files)
-    save_batches(transactions, batch_size=batch_size, prefix="transactions",
-                 out_dir=out_dir, upload_to_s3=upload_to_s3, uploaded_files=uploaded_files, batch_id=batch_id)
+    save_batches(transactions, batch_size=batch_size, prefix="transactions", out_dir=out_dir,
+                 upload_to_s3=upload_to_s3, uploaded_files=uploaded_files, batch_id=batch_id)
 
     record_metadata(uploaded_files, batch_id, output_dir=out_dir, upload_to_s3=upload_to_s3)
-    print("✅ Simulation complete.")
+    print(" Simulation complete.")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--reset-seed", action="store_true", help="Reset customer/terminal seeds")
+    args = parser.parse_args()
+    main(reset_seed=args.reset_seed)
