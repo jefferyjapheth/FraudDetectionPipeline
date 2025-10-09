@@ -103,7 +103,7 @@ services:
       /bin/sh -c "
         mc alias set localminio http://minio:9000 ${MINIO_USER} ${MINIO_PASSWORD} &&
         mc mb --ignore-existing localminio/${MINIO_BUCKET_RAW} &&
-        mc mb --ignore-existing localminio/${MINIO_BUCKET_STAGING} &&
+        mc mb --ignore-existing localminio/${MINIO_BUCKET_MASTER_DATA} &&
         mc mb --ignore-existing localminio/${MINIO_BUCKET_ARCHIVE} &&
         mc event add localminio/${MINIO_BUCKET_RAW} arn:minio:sqs::primary:kafka --event put --ignore-existing &&
         tail -f /dev/null
