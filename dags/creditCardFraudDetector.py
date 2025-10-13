@@ -4,14 +4,21 @@ from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 import logging
 import json
 import pandas as pd
+import pyarrow as pa
 from io import StringIO
+from typing import List, Dict
 
 from src.config.settings import RAW_BUCKET, ARCHIVE_BUCKET
 from src.validate.schema_validation import file_type, validate_csv_schema
 from src.validate.chunking import create_chunks_safe
-from src.extract.s3_operations import move_file
-from src.transform.iceberg_upsert import upsert_to_iceberg, initialize_iceberg_tables
-from src.transform.transformation import transform_and_join
+from src.extract.s3_operations import move_file, archive_processed_files
+from src.extract.parquet_handler import (
+    write_multiple_dataframes,
+    read_dataframe_from_parquet,
+    cleanup_temp_parquet_files
+)
+from src.transform.transformation import prepare_for_iceberg
+from src.transform.iceberg_manager import initialize_iceberg_tables, upsert_to_iceberg
 
 # -----------------------------
 # Assets
@@ -27,10 +34,24 @@ PROCESSED_ASSET = Asset("s3://archive-data/processed_creditcard_files")
     start_date=datetime(2025, 9, 18),
     schedule=[RAW_CSV_ASSET],
     catchup=False,
-    tags=["minio", "iceberg", "creditcardfraud", "etl", "parallel"],
+    tags=["minio", "iceberg", "creditcardfraud", "etl", "parallel", "parquet"],
     max_active_runs=1,
 )
 def creditcardfraud_dag():
+    """
+    Credit Card Fraud Detection ETL Pipeline (Parquet XCom Architecture)
+    
+    Flow:
+    1. Setup Iceberg tables
+    2. Validate incoming CSV files from metadata
+    3. Filter and chunk files by type (customers, terminals, transactions, travel_profiles)
+    4. Transform chunks in parallel (no joins yet)
+    5. Combine chunks by type
+    6. Perform joins across types (transactions enriched with dimensions)
+    7. Write master DataFrames to Parquet in MinIO (avoid XCom size limits)
+    8. Upsert to Iceberg (reads from Parquet, prepares, converts to PyArrow)
+    9. Archive processed files and cleanup temp Parquet files
+    """
 
     # -----------------------------
     # Initialize Iceberg tables
@@ -42,11 +63,14 @@ def creditcardfraud_dag():
         return {"status": "initialized"}
 
     # -----------------------------
-    # Validate files
+    # Validate files from metadata
     # -----------------------------
     @task
     def validate_files(setup_result, triggering_asset_events=None):
-        """Validate incoming CSV files and separate valid from invalid"""
+        """
+        Validate incoming CSV files and separate valid from invalid.
+        Returns dict with 'valid' and 'invalid' lists.
+        """
         hook = S3Hook(aws_conn_id="minio_default")
         valid_files, invalid_files = [], []
 
@@ -55,7 +79,10 @@ def creditcardfraud_dag():
             obj = hook.get_key(metadata_key, bucket_name=RAW_BUCKET)
             metadata = json.loads(obj.get()["Body"].read())
             batch_id = metadata.get("batch_id")
-            file_list = [f["s3_path"].replace(f"s3://{RAW_BUCKET}/", "") for f in metadata.get("files", [])]
+            file_list = [
+                f["s3_path"].replace(f"s3://{RAW_BUCKET}/", "") 
+                for f in metadata.get("files", [])
+            ]
         except Exception as e:
             logging.warning(f"Failed to read metadata_latest.json: {e}")
             batch_id = None
@@ -72,9 +99,14 @@ def creditcardfraud_dag():
                 invalid_files.append({"file": file_key, "batch_id": batch_id})
                 continue
 
-            validation_result = validate_csv_schema(hook, RAW_BUCKET, file_key, ftype)
+            validation_result = validate_csv_schema(hook, RAW_BUCKET, file_key, ftype, batch_id)
+            
             if validation_result.get("valid", False):
-                valid_files.append({"file": file_key, "type": ftype, "batch_id": batch_id})
+                valid_files.append({
+                    "file": file_key,
+                    "type": ftype,
+                    "batch_id": batch_id
+                })
             else:
                 move_file(hook, RAW_BUCKET, ARCHIVE_BUCKET, file_key, f"invalid/{file_key}")
                 invalid_files.append({"file": file_key, "batch_id": batch_id})
@@ -110,7 +142,6 @@ def creditcardfraud_dag():
             logging.info(f"No files to chunk for type: {file_type_val}")
             return []
         
-        # create_chunks_safe returns List[List[Dict]]
         chunks = create_chunks_safe(files)
         
         # Add metadata to each chunk for tracking
@@ -119,7 +150,7 @@ def creditcardfraud_dag():
             formatted_chunks.append({
                 "chunk_id": f"{file_type_val}_chunk_{idx}",
                 "type": file_type_val,
-                "files": chunk,  # List of file dicts
+                "files": chunk,
                 "chunk_index": idx
             })
         
@@ -133,7 +164,7 @@ def creditcardfraud_dag():
     def transform_single_chunk(chunk_data):
         """
         Transform a single chunk in parallel.
-        Reads files from S3, applies transformations, returns transformed data.
+        Reads files from S3, applies basic transformations, returns serialized data.
         NO JOINS happen here - just individual chunk transformation.
         
         Args:
@@ -154,7 +185,6 @@ def creditcardfraud_dag():
         logging.info(f"🔄 Processing chunk {chunk_id} with {len(files)} files")
         
         try:
-            # Read all files in this chunk
             all_data = []
             file_keys = []
             
@@ -187,25 +217,23 @@ def creditcardfraud_dag():
             df_combined = pd.concat(all_data, ignore_index=True)
             logging.info(f"Combined {len(df_combined)} records from {len(all_data)} files")
             
-            # Apply type-specific transformations (SCD2 handling, dtype conversions)
+            # Apply type-specific basic transformations
             if file_type_val in ["customers", "terminals"]:
-                df_combined["is_current"] = True
-                df_combined["end_date"] = pd.NaT
-                df_combined["effective_date"] = pd.to_datetime(df_combined["effective_date"], utc=True)
-                df_combined["created_at"] = pd.to_datetime(df_combined["created_at"], utc=True)
-                
-            elif file_type_val == "travel_profiles":
-                df_combined["created_at"] = pd.to_datetime(df_combined["created_at"], utc=True)
-                
+                if "effective_date" not in df_combined.columns:
+                    df_combined["effective_date"] = pd.Timestamp.utcnow()
+                if "version" not in df_combined.columns:
+                    df_combined["version"] = 1
+                    
             elif file_type_val == "transactions":
-                df_combined["created_at"] = pd.to_datetime(df_combined["created_at"], utc=True)
                 if "TX_DATETIME" in df_combined.columns:
                     df_combined["TX_DATETIME"] = pd.to_datetime(df_combined["TX_DATETIME"], utc=True)
             
             logging.info(f"✅ Chunk {chunk_id} transformed: {len(df_combined)} records")
             
             # Convert datetime columns to strings for XCom serialization
-            datetime_cols = df_combined.select_dtypes(include=['datetime64[ns, UTC]', 'datetime64[ns]']).columns
+            datetime_cols = df_combined.select_dtypes(
+                include=['datetime64[ns, UTC]', 'datetime64[ns]', 'datetime64']
+            ).columns
             for col in datetime_cols:
                 df_combined[col] = df_combined[col].astype(str)
             
@@ -215,7 +243,7 @@ def creditcardfraud_dag():
                 "type": file_type_val,
                 "data": df_combined.to_dict('records'),
                 "columns": list(df_combined.columns),
-                "datetime_columns": list(datetime_cols),  # Track which cols need reconversion
+                "datetime_columns": list(datetime_cols),
                 "record_count": len(df_combined),
                 "files": file_keys
             }
@@ -239,21 +267,18 @@ def creditcardfraud_dag():
         Returns:
             Dict of combined DataFrames by type {type: DataFrame}
         """
-        # Flatten the nested structure from multiple task groups
+        # Flatten nested structure from multiple task groups
         all_chunks = []
         
-        # Handle LazyXComSequence and nested lists
         if hasattr(transformed_chunks_list, '__iter__'):
             for item in transformed_chunks_list:
                 if item is None:
                     continue
-                # If it's a list or sequence, iterate through it
                 if hasattr(item, '__iter__') and not isinstance(item, dict):
                     for chunk in item:
                         if chunk is not None:
                             all_chunks.append(chunk)
                 else:
-                    # Single chunk dict
                     all_chunks.append(item)
         
         if not all_chunks:
@@ -279,14 +304,12 @@ def creditcardfraud_dag():
         for file_type_val, type_chunks in chunks_by_type.items():
             logging.info(f"Combining {len(type_chunks)} chunks for type: {file_type_val}")
             
-            # Reconstruct DataFrames from serialized data
             type_dfs = []
             datetime_cols = set()
             
             for chunk in type_chunks:
                 df = pd.DataFrame(chunk["data"])
                 
-                # Track datetime columns that need reconversion
                 if "datetime_columns" in chunk:
                     datetime_cols.update(chunk["datetime_columns"])
                 
@@ -295,7 +318,7 @@ def creditcardfraud_dag():
             if type_dfs:
                 combined_df = pd.concat(type_dfs, ignore_index=True)
                 
-                # Reconvert datetime columns from strings back to datetime
+                # Reconvert datetime columns from strings
                 for col in datetime_cols:
                     if col in combined_df.columns:
                         combined_df[col] = pd.to_datetime(combined_df[col], utc=True)
@@ -312,13 +335,13 @@ def creditcardfraud_dag():
     def join_master_data(combined_dfs):
         """
         Perform joins across all data types to create master DataFrames.
-        This joins transactions with customers, terminals, and travel_profiles.
+        Enriches transactions with customers, terminals, and travel_profiles.
         
         Args:
             combined_dfs: Dict of DataFrames by type {type: DataFrame}
             
         Returns:
-            Dict of master DataFrames ready for Iceberg upsert
+            Dict of master DataFrames ready for Parquet storage
         """
         if not combined_dfs:
             logging.warning("No data to join")
@@ -342,34 +365,45 @@ def creditcardfraud_dag():
             # Join with customers (left join to keep all transactions)
             if "customers" in combined_dfs:
                 df_customers = combined_dfs["customers"]
-                df_tx = df_tx.merge(
-                    df_customers[["CUSTOMER_ID", "HOME_CITY", "HOME_REGION"]],
-                    on="CUSTOMER_ID",
-                    how="left"
-                )
-                logging.info(f"✅ Joined with customers: {len(df_tx)} records")
+                join_cols = ["CUSTOMER_ID", "HOME_CITY", "HOME_REGION"]
+                available_cols = [col for col in join_cols if col in df_customers.columns]
+                
+                if available_cols:
+                    df_tx = df_tx.merge(
+                        df_customers[available_cols],
+                        on="CUSTOMER_ID",
+                        how="left"
+                    )
+                    logging.info(f"✅ Joined with customers: {len(df_tx)} records")
             
             # Join with terminals (left join to keep all transactions)
             if "terminals" in combined_dfs:
                 df_terminals = combined_dfs["terminals"]
-                df_tx = df_tx.merge(
-                    df_terminals[["TERMINAL_ID", "CITY", "REGION"]],
-                    left_on="TERMINAL_ID",
-                    right_on="TERMINAL_ID",
-                    how="left",
-                    suffixes=("", "_terminal")
-                )
-                logging.info(f"✅ Joined with terminals: {len(df_tx)} records")
+                join_cols = ["TERMINAL_ID", "CITY", "REGION"]
+                available_cols = [col for col in join_cols if col in df_terminals.columns]
+                
+                if available_cols:
+                    df_tx = df_tx.merge(
+                        df_terminals[available_cols],
+                        on="TERMINAL_ID",
+                        how="left",
+                        suffixes=("", "_terminal")
+                    )
+                    logging.info(f"✅ Joined with terminals: {len(df_tx)} records")
             
             # Join with travel profiles (left join, optional enrichment)
             if "travel_profiles" in combined_dfs:
                 df_travel = combined_dfs["travel_profiles"]
-                df_tx = df_tx.merge(
-                    df_travel[["CUSTOMER_ID", "TRAVEL_REGIONS", "AVG_TRAVEL_DISTANCE_KM"]],
-                    on="CUSTOMER_ID",
-                    how="left"
-                )
-                logging.info(f"✅ Joined with travel profiles: {len(df_tx)} records")
+                join_cols = ["CUSTOMER_ID", "TRAVEL_REGIONS", "AVG_TRAVEL_DISTANCE_KM"]
+                available_cols = [col for col in join_cols if col in df_travel.columns]
+                
+                if "CUSTOMER_ID" in available_cols:
+                    df_tx = df_tx.merge(
+                        df_travel[available_cols],
+                        on="CUSTOMER_ID",
+                        how="left"
+                    )
+                    logging.info(f"✅ Joined with travel profiles: {len(df_tx)} records")
             
             master_dfs["transactions"] = df_tx
             logging.info(f"✅ Final transactions DataFrame: {len(df_tx)} records")
@@ -378,40 +412,144 @@ def creditcardfraud_dag():
         return master_dfs
 
     # -----------------------------
-    # Upsert to Iceberg
+    # Write master DataFrames to Parquet (avoid XCom size limits)
     # -----------------------------
-    @task(outlets=[ICEBERG_ASSET])
-    def upsert_master_dfs(master_dfs):
-        """Upsert all master DataFrames to Iceberg tables"""
-        results = []
-        for t, df in master_dfs.items():
-            if df.empty:
-                logging.info(f"Skipping empty DataFrame for type: {t}")
-                continue
-            
-            logging.info(f"📤 Upserting {len(df)} records for type: {t}")
-            result = upsert_to_iceberg(df=df, file_info={"type": t})
-            results.append(result)
-            logging.info(f"✅ Upserted {result.get('records', 0)} records for {t}")
+    @task
+    def write_to_parquet(master_dfs, validated):
+        """
+        Write master DataFrames to Parquet files in MinIO.
+        Returns S3 keys instead of large DataFrames to avoid XCom limits.
         
-        return results
+        Args:
+            master_dfs: Dict of master DataFrames {type: DataFrame}
+            validated: Validation result containing batch_id
+            
+        Returns:
+            Dict of S3 keys {type: s3_key}
+        """
+        if not isinstance(master_dfs, dict):
+            logging.error(f"Expected dict, got {type(master_dfs)}")
+            return {}
+        
+        if not master_dfs:
+            logging.warning("No master DataFrames to write")
+            return {}
+        
+        # Extract batch_id from validated result
+        batch_id = validated.get("batch_id", "unknown_batch")
+        
+        hook = S3Hook(aws_conn_id="minio_default")
+        s3_keys = write_multiple_dataframes(master_dfs, batch_id, hook)
+        
+        logging.info(f"🎉 Wrote {len(s3_keys)} DataFrames to Parquet in MinIO")
+        return s3_keys
 
     # -----------------------------
-    # Archive valid files
+    # Upsert to Iceberg - Process each type separately
+    # -----------------------------
+    @task(outlets=[ICEBERG_ASSET])
+    def upsert_single_type(s3_keys_dict, file_type_val):
+        """
+        Upsert a single data type to Iceberg.
+        Reads DataFrame from Parquet, prepares it, converts to PyArrow, and upserts.
+        
+        Args:
+            s3_keys_dict: Dict of S3 keys {type: s3_key}
+            file_type_val: Type to upsert
+            
+        Returns:
+            Dict with upsert result metadata
+        """
+        if not isinstance(s3_keys_dict, dict):
+            logging.error(f"Expected dict, got {type(s3_keys_dict)}")
+            return {"type": file_type_val, "records": 0, "status": "failed"}
+        
+        if file_type_val not in s3_keys_dict:
+            logging.warning(f"Type {file_type_val} not in s3_keys_dict")
+            return {"type": file_type_val, "records": 0, "status": "skipped"}
+        
+        s3_key = s3_keys_dict[file_type_val]
+        
+        try:
+            # Read DataFrame from Parquet
+            hook = S3Hook(aws_conn_id="minio_default")
+            df = read_dataframe_from_parquet(s3_key, hook)
+            
+            if df.empty:
+                logging.info(f"Skipping empty DataFrame for type: {file_type_val}")
+                return {"type": file_type_val, "records": 0, "status": "empty"}
+            
+            logging.info(f"📋 Preparing {file_type_val} for Iceberg: {len(df)} records")
+            
+            # Prepare DataFrame (schema enforcement, transformations)
+            # prepare_for_iceberg now returns DataFrame, not PyArrow Table
+            prepared_df = prepare_for_iceberg(df)
+            
+            # Convert to PyArrow Table inline (happens here, not passed through XCom)
+            arrow_table = pa.Table.from_pandas(prepared_df)
+            
+            logging.info(f"📤 Upserting {len(arrow_table)} records for type: {file_type_val}")
+            
+            # Upsert to Iceberg
+            result = upsert_to_iceberg(file_type_val, arrow_table)
+            logging.info(f"✅ Upserted {result.get('records', 0)} records for {file_type_val}")
+            
+            return result
+            
+        except Exception as e:
+            logging.error(f"❌ Failed to upsert {file_type_val}: {e}")
+            raise
+
+    # -----------------------------
+    # Archive and cleanup
     # -----------------------------
     @task(outlets=[PROCESSED_ASSET])
-    def archive_files(master_dfs_results):
-        """Archive successfully processed files"""
-        hook = S3Hook(aws_conn_id="minio_default")
-        archived_count = 0
+    def archive_and_cleanup(validated, upsert_results, s3_keys_dict):
+        """
+        Archive successfully processed files and cleanup temp Parquet files.
         
-        for result in master_dfs_results:
-            if result.get("records", 0) > 0:
-                file_type_val = result["type"]
-                archived_count += result.get("records", 0)
+        Args:
+            validated: Original validation result with file metadata
+            upsert_results: List of upsert results
+            s3_keys_dict: Dict of temp Parquet S3 keys to cleanup
+            
+        Returns:
+            Summary dict with archive and cleanup info
+        """
+        # Build processed files list from validated data
+        valid_files = validated.get("valid", [])
+        processed_files = []
         
-        logging.info(f"✅ Archived {archived_count} records")
-        return {"archived": archived_count}
+        # Mark all valid files as successfully processed
+        for f in valid_files:
+            processed_files.append({
+                "original_path": f.get("file"),
+                "batch_id": f.get("batch_id"),
+                "status": "success"
+            })
+        
+        # Create merge result summary from upsert results
+        merge_result = {
+            "total_records": sum(r.get("records", 0) for r in upsert_results),
+            "types_processed": [r.get("type") for r in upsert_results if r.get("records", 0) > 0]
+        }
+        
+        # Archive processed files
+        archive_summary = archive_processed_files(processed_files, merge_result)
+        logging.info(f"✅ Archive complete: {archive_summary}")
+        
+        # Cleanup temporary Parquet files
+        deleted_count = 0
+        if isinstance(s3_keys_dict, dict) and s3_keys_dict:
+            s3_keys = list(s3_keys_dict.values())
+            deleted_count = cleanup_temp_parquet_files(s3_keys)
+            logging.info(f"🗑️ Cleaned up {deleted_count} temp Parquet files")
+        
+        return {
+            "archive_summary": archive_summary,
+            "archived_count": len(processed_files),
+            "temp_files_deleted": deleted_count
+        }
 
     # -----------------------------
     # Task Group for parallel chunk processing
@@ -427,50 +565,49 @@ def creditcardfraud_dag():
         2. Transform each chunk in parallel
         3. Return list of transformed chunks
         """
-        # Create chunks with file type
         chunks = create_chunks(filtered_files, file_type_val)
-        
-        # Transform chunks in parallel using dynamic task mapping
-        # .expand() creates one task instance per chunk
         transformed = transform_single_chunk.expand(chunk_data=chunks)
-        
         return transformed
 
     # -----------------------------
     # DAG Flow
     # -----------------------------
     
-    # Setup Iceberg tables
+    # 1. Setup Iceberg tables
     setup = setup_iceberg()
     
-    # Validate all incoming files
+    # 2. Validate all incoming files
     validated = validate_files(setup_result=setup)
     typed = split_by_type(validated)
     
-    # Define file types to process
+    # 3. Define file types to process
     types = ["customers", "terminals", "transactions", "travel_profiles"]
     
-    # Filter files by type
+    # 4. Filter files by type
     filtered = {t: filter_by_type(typed, t) for t in types}
     
-    # Process each type's chunks in parallel (within task groups)
-    # Each task group contains: create_chunks → transform_chunks (parallel)
+    # 5. Process each type's chunks in parallel
     transformed_by_type = [
         process_chunks_parallel(t, filtered[t]) 
         for t in types
     ]
     
-    # AFTER all chunks are transformed, combine them by type
+    # 6. Combine chunks by type
     combined_dfs = combine_chunks_by_type(transformed_by_type)
     
-    # THEN perform joins across types (transactions + customers + terminals + travel_profiles)
+    # 7. Perform joins across types
     master_dfs = join_master_data(combined_dfs)
     
-    # Upsert master DataFrames to Iceberg
-    upsert_results = upsert_master_dfs(master_dfs)
+    # 8. Write master DataFrames to Parquet (avoid XCom limits)
+    s3_keys = write_to_parquet(master_dfs, validated)
     
-    # Archive processed files
-    archive_files(upsert_results)
+    # 9. Upsert each type to Iceberg (reads from Parquet, converts to PyArrow inline)
+    types_to_upsert = ["customers", "terminals", "travel_profiles", "transactions"]
+    upsert_results = [upsert_single_type(s3_keys, t) for t in types_to_upsert]
+    
+    # 10. Archive processed files and cleanup temp Parquet files
+    archive_and_cleanup(validated, upsert_results, s3_keys)
 
 
+# Instantiate the DAG
 dag_instance = creditcardfraud_dag()

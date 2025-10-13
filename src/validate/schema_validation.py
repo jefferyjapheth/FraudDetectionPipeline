@@ -29,7 +29,7 @@ def validate_csv_schema(s3_hook, bucket, key, file_type, batch_id=None):
         file_type: str, type of file to validate
         batch_id: str, optional batch ID for idempotency tracking
 
-    Returns:
+    Returns:a
         dict: {
             "key": <file_key>,
             "file_type": <type>,
