@@ -1,142 +1,174 @@
 #!/usr/bin/env python3
 """
-MinIO Asset Event Service - Refactored for clarity and reduced cognitive complexity.
+MinIO Asset Event Service
+-------------------------
+Listens to MinIO bucket event notifications published to Kafka, identifies 
+newly uploaded CSV files, and triggers corresponding asset events in Airflow.  
+
+Core Responsibilities:
+    - Consume Kafka events emitted by MinIO.
+    - Identify valid dataset uploads (transactions, customers, terminals, etc.).
+    - Trigger Airflow asset events for downstream data pipelines.
+    - Maintain lightweight local cache of known Airflow asset URIs.
+    - Provide health checks and structured logging for observability.
+
+This service is designed for operational stability and idempotent event handling
+in Airflow-based ingestion environments.
 """
 
 import os
-import json
-import logging
-import requests
-import signal
 import sys
+import json
 import time
+import signal
+import logging
 import urllib.parse
-from kafka import KafkaConsumer
 from datetime import datetime
+from kafka import KafkaConsumer
+import requests
 
+
+# -----------------------------------------------------------------------------
+# Logging Configuration
+# -----------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger('MinIOAssetService')
+logger = logging.getLogger("MinIOAssetService")
 
 
+# -----------------------------------------------------------------------------
+# Service Definition
+# -----------------------------------------------------------------------------
 class MinIOAssetEventService:
     """
-    Consumes Kafka events from MinIO and triggers dataset updates in Airflow.
+    Kafka consumer service that listens for MinIO object creation events and
+    triggers Airflow asset updates accordingly.
     """
 
-    FILE_TYPES = ['transactions', 'customers', 'terminals', 'travel_profiles']
+    FILE_TYPES = ["transactions", "customers", "terminals", "travel_profiles"]
 
     def __init__(self):
-        """Initialize the service, load configuration, and set up resources."""
+        """Initialize configuration, set up Kafka consumer, and preload asset cache."""
         self.running = True
         self.setup_signal_handlers()
 
-        # Configuration
-        self.kafka_broker = os.getenv('KAFKA_BROKER_HOST', 'localhost:9092')
-        self.minio_kafka_topic = os.getenv('MINIO_KAFKA_TOPIC', 'minio-events')
-        self.airflow_url = os.getenv('AIRFLOW_URL_HOST', 'http://localhost:8080')
-        self.raw_bucket = os.getenv('MINIO_BUCKET_RAW', 'raw-data')
-        self.health_check_interval = int(os.getenv('HEALTH_CHECK_INTERVAL', '300'))
-        self.last_health_check = time.time()
+        # Configuration (from environment)
+        self.kafka_broker = os.getenv("KAFKA_BROKER_HOST", "localhost:9092")
+        self.kafka_topic = os.getenv("MINIO_KAFKA_TOPIC", "minio-events")
+        self.airflow_url = os.getenv("AIRFLOW_URL_HOST", "http://localhost:8080")
+        self.raw_bucket = os.getenv("MINIO_BUCKET_RAW", "raw-data")
+        self.health_check_interval = int(os.getenv("HEALTH_CHECK_INTERVAL", "300"))
 
-        # Cache for asset URI to ID mapping
+        # Internal state and statistics
         self.asset_cache = {}
-
-        # Statistics
+        self.last_health_check = time.time()
         self.events_processed = 0
         self.asset_events_created = 0
         self.errors_count = 0
 
         self.consumer = None
+
         self.initialize_consumer()
         self.load_assets()
 
-        logger.info("MinIO Asset Event Service initialized")
-        logger.info(f"Kafka: {self.kafka_broker} | Topic: {self.minio_kafka_topic}")
-        logger.info(f"Airflow: {self.airflow_url} | Bucket: {self.raw_bucket}")
-        logger.info(f"Cached assets: {list(self.asset_cache.keys())}")
+        logger.info("Service initialized successfully")
+        logger.info(f"Kafka: {self.kafka_broker} | Topic: {self.kafka_topic}")
+        logger.info(f"Airflow: {self.airflow_url} | Raw Bucket: {self.raw_bucket}")
+        logger.info(f"Cached {len(self.asset_cache)} assets at startup")
 
-    # ------------------- Setup ------------------- #
+    # -------------------------------------------------------------------------
+    # Graceful Shutdown Setup
+    # -------------------------------------------------------------------------
     def setup_signal_handlers(self):
-        """Setup graceful shutdown handlers for SIGINT and SIGTERM."""
-        def signal_handler(signum, frame):
-            logger.info(f"Received signal {signum}. Shutting down gracefully...")
+        """Attach handlers for SIGINT and SIGTERM to enable graceful shutdown."""
+
+        def handle_signal(signum, _frame):
+            logger.info(f"Received signal {signum}. Initiating shutdown...")
             self.running = False
 
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGINT, handle_signal)
+        signal.signal(signal.SIGTERM, handle_signal)
 
-    # ------------------- Kafka ------------------- #
+    # -------------------------------------------------------------------------
+    # Kafka Consumer Initialization
+    # -------------------------------------------------------------------------
     def initialize_consumer(self):
-        """Initialize Kafka consumer with retry and exponential backoff."""
+        """Create Kafka consumer with retry and exponential backoff."""
         max_retries = 5
-        retry_delay = 10
+        delay = 10
+
         for attempt in range(max_retries):
             try:
                 self.consumer = KafkaConsumer(
-                    self.minio_kafka_topic,
+                    self.kafka_topic,
                     bootstrap_servers=[self.kafka_broker],
-                    auto_offset_reset='latest',
+                    group_id="minio-airflow-asset-service",
+                    auto_offset_reset="latest",
                     enable_auto_commit=True,
-                    group_id='minio-airflow-asset-service',
-                    value_deserializer=lambda x: json.loads(x.decode('utf-8')),
+                    value_deserializer=lambda x: json.loads(x.decode("utf-8")),
                     consumer_timeout_ms=1000,
                     session_timeout_ms=30000,
-                    heartbeat_interval_ms=10000
+                    heartbeat_interval_ms=10000,
                 )
                 logger.info("Kafka consumer initialized successfully")
                 return
             except Exception as e:
-                logger.error(f"Failed to initialize Kafka consumer (attempt {attempt + 1}/{max_retries}): {e}")
+                logger.error(f"Kafka consumer init failed (attempt {attempt + 1}/{max_retries}): {e}")
                 if attempt < max_retries - 1:
-                    logger.info(f"Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2
+                    logger.info(f"Retrying in {delay}s...")
+                    time.sleep(delay)
+                    delay *= 2
                 else:
-                    logger.error("Max retries exceeded. Exiting.")
+                    logger.critical("Kafka initialization failed after max retries")
                     sys.exit(1)
 
-    # ------------------- Health Check ------------------- #
+    # -------------------------------------------------------------------------
+    # Airflow Health Check
+    # -------------------------------------------------------------------------
     def health_check(self):
-        """Perform periodic health checks."""
-        if time.time() - self.last_health_check <= self.health_check_interval:
+        """Periodically verify connectivity to Airflow."""
+        if time.time() - self.last_health_check < self.health_check_interval:
             return
+
         try:
             response = requests.get(f"{self.airflow_url}/api/v2/version", timeout=10)
             if response.status_code == 200:
                 logger.info(
-                    f"Health check OK | Processed: {self.events_processed} | "
-                    f"Created: {self.asset_events_created} | Errors: {self.errors_count}")
+                    f"Health OK | Processed={self.events_processed} | "
+                    f"Events={self.asset_events_created} | Errors={self.errors_count}"
+                )
             else:
-                logger.warning(f"Health check warning: {response.status_code}")
+                logger.warning(f"Health check returned {response.status_code}")
         except Exception as e:
             logger.error(f"Health check failed: {e}")
         finally:
             self.last_health_check = time.time()
 
-    # ------------------- Asset Management ------------------- #
+    # -------------------------------------------------------------------------
+    # Asset Management (Airflow)
+    # -------------------------------------------------------------------------
     def load_assets(self):
-        """Load all assets from Airflow and cache the URI to ID mapping."""
+        """Load existing assets from Airflow API and populate cache."""
         try:
             response = requests.get(f"{self.airflow_url}/api/v2/assets", timeout=10)
             if response.status_code != 200:
-                logger.warning(f"Failed to load assets: {response.status_code}")
+                logger.warning(f"Failed to load assets (status {response.status_code})")
                 return
-            assets_data = response.json()
-            for asset in assets_data.get('assets', []):
-                uri = asset.get('uri')
-                asset_id = asset.get('id')
+
+            for asset in response.json().get("assets", []):
+                uri = asset.get("uri")
+                asset_id = asset.get("id")
                 if uri and asset_id:
                     self.asset_cache[uri] = asset_id
-                    logger.info(f"Cached asset: {uri} -> ID {asset_id}")
+            logger.info(f"Loaded {len(self.asset_cache)} assets into cache")
         except Exception as e:
             logger.error(f"Error loading assets: {e}")
 
-    def get_asset_id(self, dataset_uri):
-        """Get asset ID from cache or fetch from API."""
+    def get_asset_id(self, dataset_uri: str):
+        """Resolve an asset URI to its Airflow asset ID."""
         if dataset_uri in self.asset_cache:
             return self.asset_cache[dataset_uri]
 
@@ -144,76 +176,80 @@ class MinIOAssetEventService:
             response = requests.get(
                 f"{self.airflow_url}/api/v2/assets",
                 params={"uri_pattern": dataset_uri},
-                timeout=10
+                timeout=10,
             )
             if response.status_code != 200:
-                logger.error(f"Asset not found for URI: {dataset_uri}")
+                logger.error(f"Asset lookup failed for {dataset_uri}")
                 return None
 
-            assets = response.json().get('assets', [])
+            assets = response.json().get("assets", [])
             if not assets:
-                logger.error(f"Asset not found for URI: {dataset_uri}")
+                logger.warning(f"No asset found for {dataset_uri}")
                 return None
 
-            asset_id = assets[0]['id']
+            asset_id = assets[0]["id"]
             self.asset_cache[dataset_uri] = asset_id
-            logger.info(f"Cached new asset: {dataset_uri} -> ID {asset_id}")
+            logger.info(f"Cached new asset mapping: {dataset_uri} → {asset_id}")
             return asset_id
         except Exception as e:
-            logger.error(f"Error fetching asset ID: {e}")
+            logger.error(f"Error fetching asset ID for {dataset_uri}: {e}")
             return None
 
-    def create_airflow_asset_event(self, dataset_uri, extra_data=None):
-        """Create an asset event in Airflow using asset_id."""
+    def create_airflow_asset_event(self, dataset_uri: str, extra_data=None) -> bool:
+        """Create an Airflow asset event entry for the given dataset."""
         asset_id = self.get_asset_id(dataset_uri)
         if not asset_id:
-            logger.error(f"Cannot create event: asset ID not found for {dataset_uri}")
             self.errors_count += 1
             return False
 
         headers = {"Content-Type": "application/json"}
-        max_retries = 3
+        payload = {"asset_id": asset_id, "extra": extra_data or {}}
 
-        for attempt in range(max_retries):
+        for attempt in range(3):
             try:
-                payload = {"asset_id": asset_id, "extra": extra_data or {}}
                 response = requests.post(
                     f"{self.airflow_url}/api/v2/assets/events",
                     headers=headers,
                     json=payload,
-                    timeout=30
+                    timeout=30,
                 )
-                if response.status_code in [200, 201]:
+                if response.status_code in (200, 201):
                     self.asset_events_created += 1
-                    logger.info(f"Created asset event for {dataset_uri} (ID: {asset_id})")
+                    logger.info(f"Asset event created for {dataset_uri} (ID: {asset_id})")
                     return True
-                logger.error(f"Failed to create asset event: {response.status_code} - {response.text}")
+                logger.error(f"Asset event creation failed ({response.status_code}): {response.text}")
             except Exception as e:
-                logger.error(f"Error creating asset event (attempt {attempt + 1}/{max_retries}): {e}")
+                logger.error(f"Error creating asset event (attempt {attempt + 1}/3): {e}")
             time.sleep(2 ** attempt)
 
         self.errors_count += 1
         return False
 
-    # ------------------- Event Processing ------------------- #
+    # -------------------------------------------------------------------------
+    # Event Handling
+    # -------------------------------------------------------------------------
     @classmethod
     def get_file_type(cls, object_key: str):
+        """Determine dataset type from S3 key prefix."""
         for ft in cls.FILE_TYPES:
-            if object_key.startswith(f"{ft}/") and object_key.endswith('.csv'):
+            if object_key.startswith(f"{ft}/") and object_key.endswith(".csv"):
                 return ft
         return None
 
     @staticmethod
     def is_relevant_event(event_name: str):
-        return event_name.startswith('s3:ObjectCreated:')
+        """Identify if an event corresponds to an object creation."""
+        return event_name.startswith("s3:ObjectCreated:")
 
-    def process_record(self, record):
-        s3_info = record.get('s3', {})
-        bucket_name = s3_info.get('bucket', {}).get('name', '')
+    def process_record(self, record: dict):
+        """Process a single MinIO event record."""
+        s3_info = record.get("s3", {})
+        bucket_name = s3_info.get("bucket", {}).get("name", "")
         if bucket_name != self.raw_bucket:
             return False
 
-        object_key = urllib.parse.unquote(s3_info.get('object', {}).get('key', ''))
+        # Normalize key (remove redundant prefixes)
+        object_key = urllib.parse.unquote(s3_info.get("object", {}).get("key", ""))
         if object_key.startswith(f"{bucket_name}/"):
             object_key = object_key[len(bucket_name) + 1:]
 
@@ -222,45 +258,47 @@ class MinIOAssetEventService:
             return False
 
         metadata = {
-            'file_key': object_key,
-            'file_path': f"s3://{bucket_name}/{object_key}",
-            'file_size_bytes': s3_info.get('object', {}).get('size', 0),
-            'bucket_name': bucket_name,
-            'file_type': file_type,
-            'event_name': record.get('EventName', ''),
-            'processed_at': datetime.now().isoformat(),
-            'source': 'minio_kafka_notification'
+            "file_key": object_key,
+            "file_path": f"s3://{bucket_name}/{object_key}",
+            "file_size_bytes": s3_info.get("object", {}).get("size", 0),
+            "bucket_name": bucket_name,
+            "file_type": file_type,
+            "event_name": record.get("EventName", ""),
+            "processed_at": datetime.utcnow().isoformat(),
+            "source": "minio_kafka_notification",
         }
 
-        return self.create_airflow_asset_event(f"s3://{bucket_name}/creditcard_files", metadata)
+        dataset_uri = f"s3://{bucket_name}/creditcard_files"
+        return self.create_airflow_asset_event(dataset_uri, metadata)
 
     def process_minio_event(self, message):
+        """Process and route a MinIO Kafka message."""
         try:
             self.events_processed += 1
             event_data = message.value
             if not isinstance(event_data, dict):
-                logger.warning(f"Received non-dict message: {event_data}")
+                logger.warning(f"Invalid event format: {event_data}")
                 return
 
-            event_name = event_data.get('EventName', '')
+            event_name = event_data.get("EventName", "")
             if not self.is_relevant_event(event_name):
                 return
 
-            records = event_data.get('Records', [])
+            records = event_data.get("Records", [])
             processed_files = sum(self.process_record(record) for record in records)
-
             if processed_files:
-                logger.info(f"Successfully processed {processed_files} file(s) from event")
+                logger.info(f"Processed {processed_files} file(s) for event {event_name}")
 
         except Exception as e:
             self.errors_count += 1
             logger.error(f"Error processing MinIO event: {e}")
 
-    # ------------------- Service Loop ------------------- #
+    # -------------------------------------------------------------------------
+    # Main Service Loop
+    # -------------------------------------------------------------------------
     def start_listening(self):
-        """Main service loop to poll Kafka for messages."""
-        logger.info("Starting MinIO Asset Event Service...")
-        logger.info("Listening for file uploads... Press Ctrl+C to stop")
+        """Main loop polling Kafka and processing MinIO events."""
+        logger.info("Starting event listener... Press Ctrl+C to stop.")
 
         try:
             while self.running:
@@ -277,26 +315,32 @@ class MinIOAssetEventService:
                     self.errors_count += 1
                     time.sleep(5)
         except KeyboardInterrupt:
-            logger.info("Received interrupt signal")
+            logger.info("Interrupted by user")
         finally:
             self.shutdown()
 
-    # ------------------- Shutdown ------------------- #
+    # -------------------------------------------------------------------------
+    # Shutdown
+    # -------------------------------------------------------------------------
     def shutdown(self):
-        """Clean shutdown procedure."""
-        logger.info("Shutting down service...")
+        """Release resources and log final metrics."""
+        logger.info("Shutting down service gracefully...")
         logger.info(
-            f"Final stats - Processed: {self.events_processed} | "
-            f"Created: {self.asset_events_created} | Errors: {self.errors_count}")
+            f"Final Stats — Processed: {self.events_processed} | "
+            f"Created: {self.asset_events_created} | Errors: {self.errors_count}"
+        )
         if self.consumer:
             self.consumer.close()
-        logger.info("Service stopped cleanly")
+        logger.info("Shutdown complete.")
 
 
+# -----------------------------------------------------------------------------
+# Entry Point
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     try:
         service = MinIOAssetEventService()
         service.start_listening()
     except Exception as e:
-        logger.error(f"Service failed to start: {e}")
+        logger.critical(f"Fatal error during startup: {e}")
         sys.exit(1)

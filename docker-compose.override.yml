@@ -1,13 +1,19 @@
+# Data Platform Stack
+# Includes Airflow API, Postgres, Metabase, MinIO, Kafka, and the Asset Event Service.
 services:
-  # This block overrides the base 'api-server' definition to add network links
-  api-server: 
+
+
+  # Airflow API Server
+  # Extends the base Airflow service with network linkage for platform integration.
+  api-server:
     environment:
-    - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+      - AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
     networks:
-      # Ensure it is on the networks defined at the bottom of the file
       - dataplatform_net
       - credit-card-fraud-detection_a176c0_airflow
 
+
+  # PostgreSQL - Core database for Airflow, Metabase, and platform services.
   postgres:
     image: postgres:17
     restart: on-failure
@@ -23,6 +29,8 @@ services:
       - dataplatform_net
       - credit-card-fraud-detection_a176c0_airflow
 
+
+  # pgAdmin - Web-based management console for PostgreSQL.
   pgadmin:
     image: dpage/pgadmin4
     restart: on-failure
@@ -35,12 +43,14 @@ services:
       - "${PGADMIN_PORT}:80"
     volumes:
       - pgadmin-data:/var/lib/pgadmin
+    depends_on:
+      - postgres
     networks:
       - dataplatform_net
       - credit-card-fraud-detection_a176c0_airflow
-    depends_on:
-      - postgres
 
+ 
+  # Metabase - Business intelligence and data visualization tool.
   metabase:
     image: metabase/metabase:latest
     restart: always
@@ -63,6 +73,9 @@ services:
       - dataplatform_net
       - credit-card-fraud-detection_a176c0_airflow
 
+
+  # MinIO - Object storage compatible with AWS S3.
+  # Configured to emit Kafka notifications on new uploads.
   minio:
     image: minio/minio
     restart: always
@@ -71,16 +84,17 @@ services:
     environment:
       - MINIO_ROOT_USER=${MINIO_USER}
       - MINIO_ROOT_PASSWORD=${MINIO_PASSWORD}
-      # Kafka notification target
       - MINIO_NOTIFY_KAFKA_ENABLE_primary=on
       - MINIO_NOTIFY_KAFKA_BROKERS_primary=${KAFKA_BROKER}
       - MINIO_NOTIFY_KAFKA_TOPIC_primary=${MINIO_KAFKA_TOPIC}
     command: server /data --console-address ":9001"
     ports:
-      - "9000:9000" # S3 API
-      - "9001:9001" # MinIO Console
+      - "9000:9000" # S3 API endpoint
+      - "9001:9001" # Web console
     volumes:
       - minio-data:/data
+    depends_on:
+      - kafka
     networks:
       - dataplatform_net
       - credit-card-fraud-detection_a176c0_airflow
@@ -90,9 +104,9 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
-    depends_on:
-      - kafka
 
+
+  # MinIO Client (mc) - Initializes buckets and Kafka notifications.
   mc:
     image: minio/mc
     restart: on-failure
@@ -112,6 +126,8 @@ services:
       - dataplatform_net
       - credit-card-fraud-detection_a176c0_airflow
 
+
+  # Kafka - Message broker used by MinIO for event notifications.
   kafka:
     image: bitnami/kafka:3.7
     restart: always
@@ -131,46 +147,38 @@ services:
       - credit-card-fraud-detection_a176c0_airflow
 
 
-  # Asset Event Service - Bridges MinIO events to Airflow (UPDATED FOR DYNAMIC JWT)
+  # Asset Event Service - Consumes MinIO events from Kafka and triggers Airflow asset updates.
+  # Includes dynamic JWT handling for Airflow authentication.
   asset-event-service:
     image: python:3.11-slim
-    container_name: creditcard-asset-event-service # Simplified name
+    container_name: creditcard-asset-event-service
     restart: unless-stopped
     working_dir: /app
     env_file:
       - .env
     environment:
       - KAFKA_BROKER_HOST=kafka:9092
-      - AIRFLOW_URL_HOST=http://api-server:8080 
+      - AIRFLOW_URL_HOST=http://api-server:8080
       - MINIO_ENDPOINT_HOST=http://minio:9000
-      
-      # Airflow credentials are needed by the token generator script
       - AIRFLOW_USERNAME=${AIRFLOW_USERNAME}
       - AIRFLOW_PASSWORD=${AIRFLOW_PASSWORD}
-
     volumes:
-      # CRITICAL FIX: Mount the dynamic entrypoint script
-      - ./entrypoint.sh:/entrypoint.sh 
-      # Mount the entire src directory (contains minio_asset_service.py and token_generator.py)
-      - ./src:/app/src 
-
+      - ./entrypoint.sh:/entrypoint.sh
+      - ./src:/app/src
     command: >
       /bin/bash -c "
-        echo ' Installing dependencies (including JWT libraries)...' &&
-        # Install the required Python packages
+        echo 'Installing dependencies...' &&
         pip install --no-cache-dir kafka-python==2.0.2 requests==2.31.0 PyJWT cryptography &&
-        echo ' Starting dynamic entrypoint...' &&
-        # Execute the shell script that generates the token and starts the main service
+        echo 'Launching dynamic entrypoint...' &&
         /entrypoint.sh
       "
     depends_on:
-        # Use dictionary format when including conditions or mixing with simple service names
-        api-server:
-          condition: service_started
-        kafka:
-          condition: service_started
-        minio:
-          condition: service_started
+      api-server:
+        condition: service_started
+      kafka:
+        condition: service_started
+      minio:
+        condition: service_started
     networks:
       - dataplatform_net
       - credit-card-fraud-detection_a176c0_airflow
@@ -186,11 +194,15 @@ services:
         max-size: "10m"
         max-file: "3"
 
+
+# Volumes
 volumes:
   postgres-data:
   pgadmin-data:
   minio-data:
 
+
+# Networks
 networks:
   dataplatform_net:
     driver: bridge
