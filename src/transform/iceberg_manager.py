@@ -1,6 +1,7 @@
 import logging
 import pandas as pd
 import pyarrow as pa
+from datetime import datetime
 from pyiceberg.catalog import load_catalog
 from pyiceberg.exceptions import NoSuchTableError
 from pyiceberg.schema import Schema
@@ -45,6 +46,140 @@ def ensure_namespace():
 
 
 # =====================================================================
+#  Batch Metadata & Idempotency Control
+# =====================================================================
+
+def initialize_batch_metadata_table():
+    """
+    Initialize the batch_metadata table for lineage tracking and replay control.
+    
+    This table records every batch processed, enabling idempotency checks
+    and providing a full audit trail of pipeline operations.
+    """
+    catalog = get_catalog()
+    table_name = f"{ICEBERG_NAMESPACE}.batch_metadata"
+    
+    try:
+        catalog.load_table(table_name)
+        logging.info(f"Table {table_name} already exists.")
+    except NoSuchTableError:
+        schema = Schema(
+            NestedField(1, "batch_id", StringType(), required=True),
+            NestedField(2, "table_name", StringType(), required=True),
+            NestedField(3, "records_processed", LongType(), required=True),
+            NestedField(4, "processing_timestamp", TimestampType(), required=True),
+            NestedField(5, "status", StringType(), required=True),
+            NestedField(6, "source_file", StringType()),
+            NestedField(7, "processor_version", StringType()),
+        )
+        partition_spec = PartitionSpec(
+            PartitionField(4, 1000, DayTransform(), "processing_date")
+        )
+        catalog.create_table(table_name, schema=schema, partition_spec=partition_spec)
+        logging.info(f"Created table: {table_name}")
+
+
+def is_batch_already_processed(table_name: str, batch_id: str) -> bool:
+    """
+    Check if a given batch has already been processed for a specific table.
+    
+    Args:
+        table_name: Target Iceberg table name (e.g., 'dim_customers').
+        batch_id: Unique identifier for the batch being processed.
+    
+    Returns:
+        bool: True if batch exists in metadata (already processed), False otherwise.
+    """
+    catalog = get_catalog()
+    metadata_table_name = f"{ICEBERG_NAMESPACE}.batch_metadata"
+    
+    try:
+        metadata_table = catalog.load_table(metadata_table_name)
+        
+        # Scan for matching batch_id and table_name
+        scan = metadata_table.scan(
+            row_filter=f"batch_id = '{batch_id}' AND table_name = '{table_name}'"
+        )
+        
+        # Check if any records exist
+        df = scan.to_pandas()
+        
+        if not df.empty:
+            logging.warning(
+                f"⚠️  BATCH ALREADY PROCESSED: batch_id='{batch_id}' "
+                f"for table='{table_name}'. Skipping to prevent duplicates."
+            )
+            return True
+        
+        return False
+        
+    except NoSuchTableError:
+        # If metadata table doesn't exist yet, batch hasn't been processed
+        logging.warning(
+            f"Batch metadata table not found. Assuming batch '{batch_id}' is new."
+        )
+        return False
+    except Exception as e:
+        logging.error(f"Error checking batch status: {e}")
+        # Fail-safe: assume not processed to avoid data loss
+        return False
+
+
+def record_batch_metadata(
+    batch_id: str,
+    table_name: str,
+    records_processed: int,
+    status: str = "success",
+    source_file: str = None,
+    processor_version: str = "1.0.0"
+):
+    """
+    Record batch processing metadata for lineage tracking and audit purposes.
+    
+    Args:
+        batch_id: Unique identifier for the batch.
+        table_name: Target table where data was written.
+        records_processed: Number of records successfully processed.
+        status: Processing status ('success', 'failed', 'partial').
+        source_file: Optional source file path or identifier.
+        processor_version: Version of the processing script/pipeline.
+    """
+    catalog = get_catalog()
+    metadata_table_name = f"{ICEBERG_NAMESPACE}.batch_metadata"
+    
+    try:
+        metadata_table = catalog.load_table(metadata_table_name)
+        
+        # Create metadata record
+        metadata_record = pd.DataFrame([{
+            "batch_id": batch_id,
+            "table_name": table_name,
+            "records_processed": records_processed,
+            "processing_timestamp": datetime.utcnow(),
+            "status": status,
+            "source_file": source_file,
+            "processor_version": processor_version,
+        }])
+        
+        # Convert to Arrow and append
+        arrow_metadata = pa.Table.from_pandas(metadata_record, preserve_index=False)
+        metadata_table.append(arrow_metadata)
+        
+        logging.info(
+            f"✅ Recorded batch metadata: batch_id='{batch_id}', "
+            f"table='{table_name}', records={records_processed}, status='{status}'"
+        )
+        
+    except NoSuchTableError:
+        logging.error(
+            f"Batch metadata table not found. Cannot record batch '{batch_id}'. "
+            f"Please run initialize_batch_metadata_table() first."
+        )
+    except Exception as e:
+        logging.error(f"Failed to record batch metadata: {e}")
+
+
+# =====================================================================
 #  Table Definition and Initialization
 # =====================================================================
 
@@ -73,9 +208,12 @@ def initialize_iceberg_tables():
     Initialize all Iceberg tables required by the pipeline.
 
     This includes dimension and fact tables for customers, terminals,
-    transactions, and travel profiles.
+    transactions, and travel profiles, plus the batch_metadata table.
     """
     ensure_namespace()
+
+    # ------------------ Batch Metadata (NEW) ------------------
+    initialize_batch_metadata_table()
 
     # ------------------ Dimension: Customers ------------------
     create_table_if_missing(
@@ -99,7 +237,7 @@ def initialize_iceberg_tables():
         PartitionSpec(PartitionField(10, 1000, DayTransform(), "effective_date_day")),
     )
 
-    # ------------------ Dimension: Terminals ------------------
+    # ------------------ Dimension: Terminals (Static - No SCD2) ------------------
     create_table_if_missing(
         "dim_terminals",
         Schema(
@@ -108,14 +246,10 @@ def initialize_iceberg_tables():
             NestedField(3, "REGION", StringType(), required=True),
             NestedField(4, "x_terminal_id", DoubleType()),
             NestedField(5, "y_terminal_id", DoubleType()),
-            NestedField(6, "version", LongType()),
-            NestedField(7, "effective_date", TimestampType()),
-            NestedField(8, "end_date", TimestampType()),
-            NestedField(9, "is_current", BooleanType()),
-            NestedField(10, "BATCH_ID", StringType()),
-            NestedField(11, "created_at", TimestampType()),
+            NestedField(6, "BATCH_ID", StringType()),
+            NestedField(7, "created_at", TimestampType()),
         ),
-        PartitionSpec(PartitionField(7, 1000, DayTransform(), "effective_date_day")),
+        PartitionSpec(PartitionField(1, 1000, BucketTransform(16), "terminal_bucket")),
     )
 
     # ------------------ Fact: Transactions ------------------
@@ -141,33 +275,40 @@ def initialize_iceberg_tables():
         PartitionSpec(PartitionField(2, 1000, DayTransform(), "tx_date")),
     )
 
-    # ------------------ Dimension: Travel Profiles ------------------
+    # ------------------ Dimension: Travel Profiles (SCD2) ------------------
     create_table_if_missing(
         "dim_travel_profiles",
         Schema(
             NestedField(1, "CUSTOMER_ID", LongType(), required=True),
             NestedField(2, "TRAVEL_REGIONS", StringType()),
             NestedField(3, "AVG_TRAVEL_DISTANCE_KM", DoubleType()),
-            NestedField(4, "BATCH_ID", StringType()),
-            NestedField(5, "created_at", TimestampType()),
+            NestedField(4, "version", LongType()),
+            NestedField(5, "effective_date", TimestampType()),
+            NestedField(6, "end_date", TimestampType()),
+            NestedField(7, "is_current", BooleanType()),
+            NestedField(8, "BATCH_ID", StringType()),
+            NestedField(9, "created_at", TimestampType()),
         ),
-        PartitionSpec(PartitionField(1, 1000, BucketTransform(16), "customer_bucket")),
+        PartitionSpec(PartitionField(5, 1000, DayTransform(), "effective_date_day")),
     )
 
     logging.info("All Iceberg tables successfully initialized.")
 
 
 # =====================================================================
-#  Data Upsert Operations
+#  Data Upsert Operations (with Batch Idempotency)
 # =====================================================================
 
-def upsert_to_iceberg(file_type: str, arrow_table: pa.Table):
+def upsert_to_iceberg(file_type: str, arrow_table: pa.Table, batch_id: str = None):
     """
     Append a PyArrow table to its corresponding Iceberg target.
+    
+    Includes batch-level idempotency check to prevent duplicate processing.
     
     Args:
         file_type: Logical type of the dataset (e.g., 'customers', 'transactions').
         arrow_table: PyArrow Table to be appended.
+        batch_id: Unique batch identifier for idempotency control.
     
     Returns:
         dict: Summary of the upsert operation.
@@ -186,22 +327,39 @@ def upsert_to_iceberg(file_type: str, arrow_table: pa.Table):
         logging.error(f"No Iceberg table mapping found for '{file_type}'.")
         return {"type": file_type, "records": 0, "status": "failed"}
 
+    #  IDEMPOTENCY CHECK: Skip if batch already processed
+    if batch_id and is_batch_already_processed(table_name, batch_id):
+        logging.info(f"Batch '{batch_id}' already processed for {table_name}. Skipping.")
+        return {"type": file_type, "records": 0, "status": "duplicate_batch"}
+
     table = catalog.load_table(f"{ICEBERG_NAMESPACE}.{table_name}")
     table.append(arrow_table)
 
+    records_processed = arrow_table.num_rows
     logging.info(
-        f"Upserted {arrow_table.num_rows} {file_type} records into {table_name}"
+        f"Upserted {records_processed} {file_type} records into {table_name}"
     )
-    return {"type": file_type, "records": arrow_table.num_rows, "status": "success"}
+
+    #  RECORD BATCH METADATA: Track successful processing
+    if batch_id:
+        record_batch_metadata(
+            batch_id=batch_id,
+            table_name=table_name,
+            records_processed=records_processed,
+            status="success"
+        )
+
+    return {"type": file_type, "records": records_processed, "status": "success"}
 
 
-def upsert_dataframe_to_iceberg(file_type: str, df: pd.DataFrame):
+def upsert_dataframe_to_iceberg(file_type: str, df: pd.DataFrame, batch_id: str = None):
     """
     Convert a DataFrame to an Arrow Table and upsert it to Iceberg.
 
     Args:
         file_type: Dataset type (e.g., 'customers', 'transactions').
         df: Pandas DataFrame to be written.
+        batch_id: Unique batch identifier for idempotency control.
 
     Returns:
         dict: Summary of the upsert operation.
@@ -211,19 +369,22 @@ def upsert_dataframe_to_iceberg(file_type: str, df: pd.DataFrame):
         return {"type": file_type, "records": 0, "status": "empty"}
 
     arrow_table = pa.Table.from_pandas(df, preserve_index=False)
-    return upsert_to_iceberg(file_type, arrow_table)
+    return upsert_to_iceberg(file_type, arrow_table, batch_id=batch_id)
 
 
-def upsert_to_iceberg_with_scd2(file_type: str, arrow_table: pa.Table):
+def upsert_to_iceberg_with_scd2(file_type: str, arrow_table: pa.Table, batch_id: str = None):
     """
     Perform upsert to Iceberg, applying Slowly Changing Dimension (Type 2) logic
     for dimension tables (customers, terminals).
 
     For fact tables, a simple append is performed.
 
+    Includes batch-level idempotency check to prevent duplicate processing.
+
     Args:
         file_type: Data type identifier ('customers', 'terminals', 'transactions', etc.).
         arrow_table: PyArrow Table containing the new records.
+        batch_id: Unique batch identifier for idempotency control.
 
     Returns:
         dict: Summary of the upsert operation.
@@ -241,6 +402,11 @@ def upsert_to_iceberg_with_scd2(file_type: str, arrow_table: pa.Table):
     if not table_name:
         logging.error(f"No Iceberg table mapping found for '{file_type}'.")
         return {"type": file_type, "records": 0, "status": "failed"}
+
+    #  IDEMPOTENCY CHECK: Skip if batch already processed
+    if batch_id and is_batch_already_processed(table_name, batch_id):
+        logging.info(f"Batch '{batch_id}' already processed for {table_name}. Skipping.")
+        return {"type": file_type, "records": 0, "status": "duplicate_batch"}
 
     table = catalog.load_table(f"{ICEBERG_NAMESPACE}.{table_name}")
 
@@ -266,6 +432,16 @@ def upsert_to_iceberg_with_scd2(file_type: str, arrow_table: pa.Table):
         # Skip if there are no new or changed records
         if df_scd2.empty:
             logging.info(f"No changes detected for {file_type}, skipping upsert.")
+            
+            #  RECORD METADATA: Even for no-change batches (for audit completeness)
+            if batch_id:
+                record_batch_metadata(
+                    batch_id=batch_id,
+                    table_name=table_name,
+                    records_processed=0,
+                    status="no_changes"
+                )
+            
             return {"type": file_type, "records": 0, "status": "no_changes"}
 
         # Convert processed DataFrame back to Arrow format
@@ -274,7 +450,18 @@ def upsert_to_iceberg_with_scd2(file_type: str, arrow_table: pa.Table):
     # Append final Arrow Table to Iceberg
     table.append(arrow_table)
 
+    records_processed = arrow_table.num_rows
     logging.info(
-        f"Upserted {arrow_table.num_rows} {file_type} records into {table_name}"
+        f"Upserted {records_processed} {file_type} records into {table_name}"
     )
-    return {"type": file_type, "records": arrow_table.num_rows, "status": "success"}
+
+    # RECORD BATCH METADATA: Track successful processing
+    if batch_id:
+        record_batch_metadata(
+            batch_id=batch_id,
+            table_name=table_name,
+            records_processed=records_processed,
+            status="success"
+        )
+
+    return {"type": file_type, "records": records_processed, "status": "success"}

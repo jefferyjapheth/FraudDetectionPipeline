@@ -1,7 +1,7 @@
 """
 ghana_fraud_simulator_scd2.py
 
-Enhanced Ghana Fraud Simulator with SCD Type 2–ready seeds and auto-archiving.
+Enhanced Ghana Fraud Simulator with SCD Type 2 for travel profiles (NOT terminals).
 Uses real geographic coordinates (x=longitude, y=latitude) while preserving
 existing column names for downstream compatibility.
 
@@ -10,6 +10,12 @@ Produces:
  - transactions in batched CSVs
  - metadata JSON with batch manifest
 Uploads optionally to S3/MinIO and archives previous seeds.
+
+SCD2 MODEL:
+ - dim_customers: SCD2 tracking (version, effective_date, end_date, is_current)
+ - dim_terminals: Regular dimension (NO version tracking)
+ - dim_travel_profiles: SCD2 tracking (version, effective_date, end_date, is_current)
+ - fact_transactions: Append-only facts
 """
 
 import os
@@ -40,7 +46,6 @@ logger = logging.getLogger("ghana_fraud_simulator")
 # =============================================================================
 # Ghana Regions and Cities (real coords: x = longitude, y = latitude)
 # =============================================================================
-# Note: we intentionally keep the column names x/y to remain backward-compatible
 GHANA_CITIES = [
     {"city": "Accra", "region": "Greater Accra", "x": -0.1870, "y": 5.6037},
     {"city": "Kumasi", "region": "Ashanti", "x": -1.6244, "y": 6.6885},
@@ -61,7 +66,6 @@ def haversine_distance(x1: float, y1: float, x2: float, y2: float) -> float:
     Compute great-circle distance (in kilometers) between two points.
     Input: x = longitude, y = latitude (decimal degrees).
     """
-    # Earth radius in kilometers
     R = 6371.0
     lat1, lon1, lat2, lon2 = map(radians, (y1, x1, y2, x2))
     dlat = lat2 - lat1
@@ -79,7 +83,6 @@ def compute_average_region_distances() -> Dict[Tuple[str, str], float]:
     region_centroids: Dict[str, Tuple[float, float]] = {}
     for r in REGIONS:
         cities = [c for c in GHANA_CITIES if c["region"] == r]
-        # centroid in (lon, lat) stored as (x_mean, y_mean)
         region_centroids[r] = (
             float(np.mean([c["x"] for c in cities])),
             float(np.mean([c["y"] for c in cities])),
@@ -130,7 +133,6 @@ def evolve_customers(customers: pd.DataFrame, evolve_prob: float = 0.1) -> pd.Da
             new_row["effective_date"] = datetime.utcnow().isoformat()
             new_row["HOME_CITY"] = city_info["city"]
             new_row["HOME_REGION"] = city_info["region"]
-            # small noise in degrees (~ up to a few km)
             new_row["x_customer_id"] = city_info["x"] + float(np.random.normal(0, 0.02))
             new_row["y_customer_id"] = city_info["y"] + float(np.random.normal(0, 0.02))
             new_row["mean_amount"] = float(np.random.uniform(10, 200))
@@ -141,29 +143,43 @@ def evolve_customers(customers: pd.DataFrame, evolve_prob: float = 0.1) -> pd.Da
     return customers
 
 
-def evolve_terminals(terminals: pd.DataFrame, evolve_prob: float = 0.05) -> pd.DataFrame:
+def evolve_travel_profiles(travel_profiles: pd.DataFrame, evolve_prob: float = 0.15) -> pd.DataFrame:
     """
-    Randomly evolve terminals (simulate relocations/updates).
+    Randomly evolve travel profiles (simulate SCD Type 2).
     Updates:
       - version increment
       - effective_date to now (ISO)
-      - CITY/REGION and x/y coordinates (small noise)
+      - TRAVEL_REGIONS (add/remove regions)
+      - AVG_TRAVEL_DISTANCE_KM recalculated
+    
+    This captures changing customer travel patterns over time.
     """
+    avg_region_distances = compute_average_region_distances()
     updated = []
-    for _, row in terminals.iterrows():
+    
+    for _, row in travel_profiles.iterrows():
         if random.random() < evolve_prob:
-            city_info = random.choice(GHANA_CITIES)
             new_row = row.copy()
             new_row["version"] = int(new_row.get("version", 1)) + 1
             new_row["effective_date"] = datetime.utcnow().isoformat()
-            new_row["CITY"] = city_info["city"]
-            new_row["REGION"] = city_info["region"]
-            new_row["x_terminal_id"] = city_info["x"] + float(np.random.normal(0, 0.02))
-            new_row["y_terminal_id"] = city_info["y"] + float(np.random.normal(0, 0.02))
+            
+            # Modify travel regions (add or change)
+            current_regions = row["TRAVEL_REGIONS"].split(",") if row["TRAVEL_REGIONS"] else []
+            new_travel_regions = random.sample(REGIONS, k=random.randint(1, 3))
+            new_row["TRAVEL_REGIONS"] = ",".join(new_travel_regions)
+            
+            # Recalculate average distance (needs customer home region)
+            # For simplicity, use random region as home base for distance calc
+            home_region = random.choice(REGIONS)
+            avg_dist = float(np.mean([avg_region_distances[(home_region, r)] for r in new_travel_regions]))
+            new_row["AVG_TRAVEL_DISTANCE_KM"] = round(avg_dist, 2)
+            
             updated.append(new_row)
+    
     if updated:
-        terminals = pd.concat([terminals, pd.DataFrame(updated)], ignore_index=True)
-    return terminals
+        travel_profiles = pd.concat([travel_profiles, pd.DataFrame(updated)], ignore_index=True)
+    
+    return travel_profiles
 
 
 def load_or_generate_customers(n_customers: int, seed_dir: str = "data/seeds", reset: bool = False) -> pd.DataFrame:
@@ -186,14 +202,16 @@ def load_or_generate_customers(n_customers: int, seed_dir: str = "data/seeds", r
 
 
 def load_or_generate_terminals(n_terminals: int, seed_dir: str = "data/seeds", reset: bool = False) -> pd.DataFrame:
-    """Load existing terminals seed or generate new terminals if reset or missing."""
+    """
+    Load existing terminals seed or generate new terminals if reset or missing.
+    NOTE: Terminals are NOT SCD2 - they are regular dimensions without version tracking.
+    """
     os.makedirs(seed_dir, exist_ok=True)
     seed_path = Path(seed_dir) / "terminals_seed.csv"
 
     if not reset and seed_path.exists():
         terminals = pd.read_csv(seed_path)
-        terminals = evolve_terminals(terminals)
-        logger.info("Loaded and evolved terminals seed: %s rows", len(terminals))
+        logger.info("Loaded terminals seed: %s rows (no evolution - static dimension)", len(terminals))
     else:
         if seed_path.exists():
             archive_old_seed(seed_path)
@@ -204,11 +222,33 @@ def load_or_generate_terminals(n_terminals: int, seed_dir: str = "data/seeds", r
     return terminals
 
 
+def load_or_generate_travel_profiles(customers: pd.DataFrame, avg_region_distances: Dict[Tuple[str, str], float], seed_dir: str = "data/seeds", reset: bool = False) -> pd.DataFrame:
+    """
+    Load existing travel profiles seed or generate new ones if reset or missing.
+    NOTE: Travel profiles ARE SCD2 - they track changing customer travel patterns.
+    """
+    os.makedirs(seed_dir, exist_ok=True)
+    seed_path = Path(seed_dir) / "travel_profiles_seed.csv"
+
+    if not reset and seed_path.exists():
+        travel_profiles = pd.read_csv(seed_path)
+        travel_profiles = evolve_travel_profiles(travel_profiles)
+        logger.info("Loaded and evolved travel profiles seed: %s rows", len(travel_profiles))
+    else:
+        if seed_path.exists():
+            archive_old_seed(seed_path)
+        travel_profiles = generate_customer_travel_profiles(customers, avg_region_distances)
+        logger.info("Generated new travel profiles seed: %s rows", len(travel_profiles))
+
+    travel_profiles.to_csv(seed_path, index=False)
+    return travel_profiles
+
+
 # =============================================================================
 # Generators
 # =============================================================================
 def generate_customers(n_customers: int = 500, seed: int = 0) -> pd.DataFrame:
-    """Generate customers with real-location coordinates (x=lon, y=lat)."""
+    """Generate customers with real-location coordinates (x=lon, y=lat) and SCD2 fields."""
     np.random.seed(seed)
     now = datetime.utcnow().isoformat()
     customers = []
@@ -223,7 +263,6 @@ def generate_customers(n_customers: int = 500, seed: int = 0) -> pd.DataFrame:
             "CUSTOMER_ID": int(i),
             "HOME_CITY": city_info["city"],
             "HOME_REGION": city_info["region"],
-            # x = longitude, y = latitude; add small noise
             "x_customer_id": float(city_info["x"] + np.random.normal(0, 0.02)),
             "y_customer_id": float(city_info["y"] + np.random.normal(0, 0.02)),
             "mean_amount": mean_amount,
@@ -239,9 +278,11 @@ def generate_customers(n_customers: int = 500, seed: int = 0) -> pd.DataFrame:
 
 
 def generate_terminals(n_terminals: int = 1000, seed: int = 1) -> pd.DataFrame:
-    """Generate terminals with real-location coordinates (x=lon, y=lat)."""
+    """
+    Generate terminals with real-location coordinates (x=lon, y=lat).
+    NOTE: NO SCD2 fields - terminals are static dimensions.
+    """
     np.random.seed(seed)
-    now = datetime.utcnow().isoformat()
     terminals = []
 
     for i in range(n_terminals):
@@ -252,8 +293,7 @@ def generate_terminals(n_terminals: int = 1000, seed: int = 1) -> pd.DataFrame:
             "REGION": city_info["region"],
             "x_terminal_id": float(city_info["x"] + np.random.normal(0, 0.02)),
             "y_terminal_id": float(city_info["y"] + np.random.normal(0, 0.02)),
-            "version": 1,
-            "effective_date": now,
+            # NO version or effective_date - static dimension
         })
 
     df = pd.DataFrame(terminals)
@@ -262,16 +302,25 @@ def generate_terminals(n_terminals: int = 1000, seed: int = 1) -> pd.DataFrame:
 
 
 def generate_customer_travel_profiles(customers: pd.DataFrame, avg_region_distances: Dict[Tuple[str, str], float], max_regions: int = 3) -> pd.DataFrame:
-    """Create travel profiles (comma-separated regions and avg distance)."""
+    """
+    Create travel profiles with SCD2 fields (version, effective_date).
+    Travel profiles track customer travel patterns which change over time.
+    """
+    now = datetime.utcnow().isoformat()
     profiles = []
+    
     for _, cust in customers.iterrows():
         travel_regions = random.sample(REGIONS, k=random.randint(1, max_regions))
         avg_dist = float(np.mean([avg_region_distances[(cust["HOME_REGION"], r)] for r in travel_regions]))
+        
         profiles.append({
             "CUSTOMER_ID": int(cust["CUSTOMER_ID"]),
             "TRAVEL_REGIONS": ",".join(travel_regions),
             "AVG_TRAVEL_DISTANCE_KM": round(avg_dist, 2),
+            "version": 1,
+            "effective_date": now,
         })
+    
     return pd.DataFrame(profiles)
 
 
@@ -292,9 +341,13 @@ def generate_transactions(
     window_seconds = window_minutes * 60
 
     for _, cust in customers.iterrows():
-        # number of transactions is Poisson-distributed around mean_nb_tx_per_day
         nb_tx = np.random.poisson(max(0.1, cust.get("mean_nb_tx_per_day", 1)))
-        profile = travel_profiles.loc[travel_profiles["CUSTOMER_ID"] == cust["CUSTOMER_ID"]].iloc[0]
+        
+        # Get the most recent (current) travel profile for this customer
+        profile_records = travel_profiles.loc[travel_profiles["CUSTOMER_ID"] == cust["CUSTOMER_ID"]]
+        if len(profile_records) == 0:
+            continue
+        profile = profile_records.iloc[-1]  # Get latest version
         allowed_regions = profile["TRAVEL_REGIONS"].split(",")
 
         for _ in range(nb_tx):
@@ -458,9 +511,11 @@ def main(reset_seed: bool = False) -> None:
     logger.info("Generating %s customers and %s terminals", n_customers, n_terminals)
 
     avg_region_distances = compute_average_region_distances()
+    
+    # Load/generate seeds with proper SCD2 model
     customers = load_or_generate_customers(n_customers, reset=reset_seed)
-    terminals = load_or_generate_terminals(n_terminals, reset=reset_seed)
-    travel_profiles = generate_customer_travel_profiles(customers, avg_region_distances)
+    terminals = load_or_generate_terminals(n_terminals, reset=reset_seed)  # NO SCD2
+    travel_profiles = load_or_generate_travel_profiles(customers, avg_region_distances, reset=reset_seed)  # WITH SCD2
 
     transactions = generate_transactions(customers, terminals, avg_region_distances, travel_profiles, window_minutes=window_minutes)
 
@@ -475,7 +530,7 @@ def main(reset_seed: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Ghana Fraud Data Simulator (SCD Type 2 Ready)")
-    parser.add_argument("--reset-seed", action="store_true", help="Reset customer/terminal seed data")
+    parser = argparse.ArgumentParser(description="Ghana Fraud Data Simulator (SCD Type 2 for Travel Profiles)")
+    parser.add_argument("--reset-seed", action="store_true", help="Reset customer/terminal/travel_profile seed data")
     args = parser.parse_args()
     main(reset_seed=args.reset_seed)

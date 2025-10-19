@@ -9,6 +9,12 @@ This module provides:
 
 Used by transformation and upsert pipelines to ensure consistent, Iceberg-compatible
 data structures.
+
+CORRECTED SCD2 MODEL:
+- dim_customers: SCD2 tracking (version, effective_date, end_date, is_current)
+- dim_terminals: Static dimension (NO version tracking)
+- dim_travel_profiles: SCD2 tracking (version, effective_date, end_date, is_current)
+- fact_transactions: Append-only facts
 """
 
 import logging
@@ -35,10 +41,12 @@ SCHEMA_DEFINITIONS: Dict[str, Dict[str, Dict[str, str]]] = {
             "mean_amount": "float64",
             "std_amount": "float64",
             "mean_nb_tx_per_day": "float64",
+            # SCD2 fields for tracking customer changes
             "version": "int64",
             "effective_date": "datetime64[us]",
             "end_date": "datetime64[us]",
             "is_current": "bool",
+            # Batch tracking
             "BATCH_ID": "string",
             "created_at": "datetime64[us]",
         },
@@ -52,19 +60,25 @@ SCHEMA_DEFINITIONS: Dict[str, Dict[str, Dict[str, str]]] = {
         "optional": {
             "x_terminal_id": "float64",
             "y_terminal_id": "float64",
-            "version": "int64",
-            "effective_date": "datetime64[us]",
-            "end_date": "datetime64[us]",
-            "is_current": "bool",
+            # NO SCD2 fields - terminals are static dimensions
+            # Batch tracking only
             "BATCH_ID": "string",
             "created_at": "datetime64[us]",
         },
     },
     "travel_profiles": {
-        "required": {"CUSTOMER_ID": "int64"},
+        "required": {
+            "CUSTOMER_ID": "int64",
+        },
         "optional": {
             "TRAVEL_REGIONS": "string",
             "AVG_TRAVEL_DISTANCE_KM": "float64",
+            # SCD2 fields for tracking travel pattern changes
+            "version": "int64",
+            "effective_date": "datetime64[us]",
+            "end_date": "datetime64[us]",
+            "is_current": "bool",
+            # Batch tracking
             "BATCH_ID": "string",
             "created_at": "datetime64[us]",
         },
@@ -86,6 +100,7 @@ SCHEMA_DEFINITIONS: Dict[str, Dict[str, Dict[str, str]]] = {
             "AVG_REGION_DISTANCE_KM": "float64",
             "IS_NEW_REGION": "bool",
             "CUSTOMER_TRAVEL_REGIONS": "string",
+            # Batch tracking
             "BATCH_ID": "string",
             "created_at": "datetime64[us]",
         },
@@ -181,10 +196,11 @@ def prepare_for_iceberg(df: pd.DataFrame, file_type: Optional[str] = None) -> pd
     Steps:
         1. Infer entity type if not provided.
         2. Normalize timestamps to microsecond precision.
-        3. Add and populate SCD2 fields for dimension tables.
-        4. Enforce schema and fill defaults.
-        5. Drop extra columns not defined in schema.
-        6. Validate required fields are non-null.
+        3. Add and populate SCD2 fields for SCD2 dimension tables (customers, travel_profiles).
+        4. Ensure batch tracking fields exist (BATCH_ID, created_at).
+        5. Enforce schema and fill defaults.
+        6. Drop extra columns not defined in schema.
+        7. Validate required fields are non-null.
 
     Returns:
         Iceberg-ready pandas DataFrame.
@@ -207,9 +223,18 @@ def prepare_for_iceberg(df: pd.DataFrame, file_type: Optional[str] = None) -> pd
     for col in df.select_dtypes(include=["datetime64[ns, UTC]", "datetime64[ns]", "datetime64"]).columns:
         df[col] = pd.to_datetime(df[col]).dt.tz_localize(None).dt.as_unit("us")
 
-    # Add SCD2 fields for dimensional data
-    if file_type in ["customers", "terminals"]:
-        logging.info(f"Adding SCD2 fields for {file_type}")
+    # Ensure batch tracking fields exist for all entity types
+    if "BATCH_ID" not in df.columns:
+        df["BATCH_ID"] = "unknown_batch"
+        logging.warning(f"Added missing BATCH_ID field for {file_type}")
+    
+    if "created_at" not in df.columns:
+        df["created_at"] = pd.Timestamp.utcnow()
+        logging.warning(f"Added missing created_at field for {file_type}")
+
+    # Add SCD2 fields ONLY for SCD2 dimensions (customers, travel_profiles)
+    if file_type in ["customers", "travel_profiles"]:
+        logging.info(f"Adding SCD2 fields for {file_type} (SCD2 dimension)")
 
         if "is_current" not in df.columns:
             df["is_current"] = True
@@ -233,6 +258,18 @@ def prepare_for_iceberg(df: pd.DataFrame, file_type: Optional[str] = None) -> pd
             df["effective_date"] = pd.to_datetime(df["effective_date"]).dt.tz_localize(None).dt.as_unit("us")
 
         logging.info(f"SCD2 fields initialized for {file_type}")
+    
+    elif file_type == "terminals":
+        logging.info(f"Processing terminals as static dimension (NO SCD2 fields)")
+        # Explicitly remove any SCD2 fields that might have been added upstream
+        scd2_fields = ["version", "effective_date", "end_date", "is_current"]
+        for field in scd2_fields:
+            if field in df.columns:
+                df = df.drop(columns=[field])
+                logging.info(f"Removed SCD2 field '{field}' from terminals (static dimension)")
+    
+    elif file_type == "transactions":
+        logging.info(f"Processing transactions as append-only facts (NO SCD2 fields)")
 
     # Apply schema enforcement and fill missing values
     df = _enforce_schema(df, {**required_cols, **optional_cols})
@@ -248,7 +285,10 @@ def prepare_for_iceberg(df: pd.DataFrame, file_type: Optional[str] = None) -> pd
             logging.error(f"Required column '{col}' contains nulls; filling with defaults.")
             df[col] = df[col].fillna(_default_for_dtype(dtype))
 
-    logging.info(f"Prepared {file_type}: {len(df)} records, {len(df.columns)} columns (Iceberg-ready).")
+    logging.info(
+        f"Prepared {file_type}: {len(df)} records, {len(df.columns)} columns "
+        f"(SCD2: {file_type in ['customers', 'travel_profiles']}, Iceberg-ready)."
+    )
     return df
 
 
@@ -291,8 +331,12 @@ def prepare_for_iceberg_with_arrow(df: pd.DataFrame, file_type: Optional[str] = 
     new_schema = pa.schema(fields)
 
     arrow_table = arrow_table.cast(new_schema)
+    
+    # Log SCD2 status for clarity
+    scd2_status = "SCD2" if file_type in ["customers", "travel_profiles"] else "static" if file_type == "terminals" else "fact"
+    
     logging.info(
-        f"Created PyArrow table for {file_type} with {len(required_cols)} non-nullable fields, "
+        f"Created PyArrow table for {file_type} ({scd2_status}) with {len(required_cols)} non-nullable fields, "
         f"{len(arrow_table)} rows total."
     )
     return arrow_table

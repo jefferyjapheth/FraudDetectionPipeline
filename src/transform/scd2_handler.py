@@ -2,6 +2,12 @@
 SCD2 Handler - Manages Slowly Changing Dimension Type 2 Logic
 Tracks historical changes by comparing incoming data with existing Iceberg records
 
+CORRECTED MODEL:
+- dim_customers: SCD2 tracking (version, effective_date, end_date, is_current)
+- dim_terminals: Static dimension (NO SCD2 tracking)
+- dim_travel_profiles: SCD2 tracking (version, effective_date, end_date, is_current)
+- fact_transactions: Append-only (NO SCD2 tracking)
+
 CRITICAL FIX: Proper index handling for boolean Series filtering
 """
 
@@ -37,9 +43,12 @@ def apply_scd2_logic(
          a. Close old version (is_current=False, end_date=now)
          b. Insert new version (is_current=True, version+1, effective_date=now)
     
+    IMPORTANT: Only applies to SCD2 dimensions (customers, travel_profiles).
+               Terminals are static and should NOT use this function.
+    
     Args:
         incoming_df: New data to upsert
-        file_type: Type of dimension (customers, terminals)
+        file_type: Type of dimension (customers, travel_profiles)
         business_keys: Columns that uniquely identify a record (e.g., ["CUSTOMER_ID"])
         compare_columns: Columns to check for changes (e.g., ["HOME_CITY", "HOME_REGION"])
     
@@ -49,7 +58,7 @@ def apply_scd2_logic(
     
     table_map = {
         "customers": "dim_customers",
-        "terminals": "dim_terminals"
+        "travel_profiles": "dim_travel_profiles"
     }
     
     if file_type not in table_map:
@@ -190,7 +199,7 @@ def apply_scd2_logic(
                 unchanged_count += 1
                 logging.debug(f"No change for {business_keys[0]}={incoming_row[business_keys[0]]}, skipping")
     
-    logging.info(f"SCD2 Summary: {new_count} new, {changed_count} changed, {unchanged_count} unchanged")
+    logging.info(f"SCD2 Summary for {file_type}: {new_count} new, {changed_count} changed, {unchanged_count} unchanged")
     
     if not records_to_append:
         logging.warning("No records to append after SCD2 processing (all unchanged)")
@@ -204,13 +213,16 @@ def apply_scd2_logic(
         if col in result_df.columns:
             result_df[col] = pd.to_datetime(result_df[col]).dt.tz_localize(None)
     
-    logging.info(f"SCD2 processing complete: {len(result_df)} records to append")
+    logging.info(f"SCD2 processing complete for {file_type}: {len(result_df)} records to append")
     return result_df
 
 
 def get_scd2_config(file_type: str) -> dict:
     """
     Get SCD2 configuration for each dimension type.
+    
+    CORRECTED: Only customers and travel_profiles use SCD2.
+               Terminals are static dimensions.
     
     Returns:
         dict: {
@@ -231,15 +243,14 @@ def get_scd2_config(file_type: str) -> dict:
                 "mean_nb_tx_per_day"
             ]
         },
-        "terminals": {
-            "business_keys": ["TERMINAL_ID"],
+        "travel_profiles": {
+            "business_keys": ["CUSTOMER_ID"],
             "compare_columns": [
-                "CITY",
-                "REGION",
-                "x_terminal_id",
-                "y_terminal_id"
+                "TRAVEL_REGIONS",
+                "AVG_TRAVEL_DISTANCE_KM"
             ]
         }
+        # terminals intentionally excluded - static dimension with no SCD2
     }
     
     return configs.get(file_type, {"business_keys": [], "compare_columns": []})

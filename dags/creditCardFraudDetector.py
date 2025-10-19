@@ -15,11 +15,13 @@ Architecture:
 Data Model:
     Dimensions (SCD2):
         - dim_customers: Customer profiles with location and behavior metrics
-        - dim_terminals: Terminal locations with geographic coordinates
+        - dim_travel_profiles: Customer travel patterns (tracks changing behavior)
+    
+    Dimensions (Regular):
+        - dim_terminals: Terminal locations with geographic coordinates (static)
     
     Facts (append-only):
         - fact_transactions: Transaction events (pre-enriched by simulator)
-        - dim_travel_profiles: Customer travel patterns
     
 Performance Considerations:
     - Parallel chunk processing for large files
@@ -28,7 +30,7 @@ Performance Considerations:
     - Schema enforcement before Iceberg upsert
 
 Author: Data Engineering Team
-Version: 2.1 (Refactored naming conventions)
+Version: 2.2 (Corrected SCD2 model - travel_profiles, not terminals)
 """
 
 from airflow.sdk import dag, task, Asset, task_group
@@ -83,7 +85,8 @@ def creditcardfraud_dag():
         9. Archive processed files and cleanup temporary artifacts
     
     SCD2 Implementation:
-        - Tracks historical changes for customer and terminal dimensions
+        - Tracks historical changes for customer and travel_profile dimensions
+        - Terminals are static dimensions (no version tracking)
         - Maintains version history with effective_date and end_date
         - Preserves current/historical flags for time-travel queries
     """
@@ -95,9 +98,9 @@ def creditcardfraud_dag():
         
         Creates four tables:
             - dim_customers: Customer dimension with SCD2 tracking
-            - dim_terminals: Terminal dimension with SCD2 tracking
+            - dim_terminals: Terminal dimension (static, no SCD2)
+            - dim_travel_profiles: Travel patterns dimension with SCD2 tracking
             - fact_transactions: Transaction facts (append-only)
-            - dim_travel_profiles: Customer travel patterns (append-only)
         
         Returns:
             dict: Status indicator for downstream task dependencies
@@ -249,11 +252,13 @@ def creditcardfraud_dag():
         Transformations Applied:
             1. Read CSV data from S3
             2. Add batch tracking columns (BATCH_ID, created_at)
-            3. For dimensions (customers, terminals):
+            3. For SCD2 dimensions (customers, travel_profiles):
                - Initialize SCD2 tracking fields (version, effective_date, end_date, is_current)
-            4. For transactions:
+            4. For static dimensions (terminals):
+               - No version tracking needed
+            5. For transactions:
                - Parse and validate TX_DATETIME timestamps
-            5. Serialize to dict format for XCom transfer
+            6. Serialize to dict format for XCom transfer
         
         Note: No cross-entity joins occur here - each chunk is independent.
               Transactions are already enriched by the simulator with dimension attributes.
@@ -310,8 +315,8 @@ def creditcardfraud_dag():
             logging.info(f"Combined {len(df_combined)} records from {len(all_data)} files")
             
             # Apply entity-specific transformations
-            if entity_type in ["customers", "terminals"]:
-                # Initialize SCD2 tracking fields early
+            if entity_type in ["customers", "travel_profiles"]:
+                # Initialize SCD2 tracking fields early for SCD2 dimensions
                 # This is critical - fields must exist before SCD2 logic in upsert phase
                 if "is_current" not in df_combined.columns:
                     df_combined["is_current"] = True
@@ -323,6 +328,10 @@ def creditcardfraud_dag():
                     df_combined["effective_date"] = pd.Timestamp.utcnow()
                 
                 logging.info(f"Added SCD2 tracking fields to {entity_type} chunk")
+            
+            elif entity_type == "terminals":
+                # Terminals are static dimensions - NO SCD2 fields needed
+                logging.info(f"Processing terminals as static dimension (no SCD2 tracking)")
                     
             elif entity_type == "transactions":
                 # Normalize transaction timestamps to UTC
@@ -489,17 +498,17 @@ def creditcardfraud_dag():
                 if entity_type == "customers":
                     key_col = "CUSTOMER_ID"
                     unique_count = df[key_col].nunique()
-                    logging.info(f"{entity_type}: {row_count} records, {unique_count} unique customers, {col_count} columns")
+                    logging.info(f"{entity_type}: {row_count} records, {unique_count} unique customers, {col_count} columns (SCD2)")
                     
                 elif entity_type == "terminals":
                     key_col = "TERMINAL_ID"
                     unique_count = df[key_col].nunique()
-                    logging.info(f"{entity_type}: {row_count} records, {unique_count} unique terminals, {col_count} columns")
+                    logging.info(f"{entity_type}: {row_count} records, {unique_count} unique terminals, {col_count} columns (static)")
                     
                 elif entity_type == "travel_profiles":
                     key_col = "CUSTOMER_ID"
                     unique_count = df[key_col].nunique()
-                    logging.info(f"{entity_type}: {row_count} records, {unique_count} unique profiles, {col_count} columns")
+                    logging.info(f"{entity_type}: {row_count} records, {unique_count} unique profiles, {col_count} columns (SCD2)")
                     
                 elif entity_type == "transactions":
                     # Verify transactions have required enrichment from simulator
@@ -584,7 +593,7 @@ def creditcardfraud_dag():
         Upsert a single entity type to its corresponding Iceberg table.
         
         SCD2 Logic Application:
-            For dimensions (customers, terminals):
+            For SCD2 dimensions (customers, travel_profiles):
                 1. Read existing records from Iceberg
                 2. Compare incoming records against current versions
                 3. For changed records:
@@ -593,7 +602,11 @@ def creditcardfraud_dag():
                 4. For new records: Insert with version=1, is_current=True
                 5. For unchanged records: Skip (no duplicate insertion)
             
-            For facts (transactions, travel_profiles):
+            For static dimensions (terminals):
+                - Simple upsert by primary key (TERMINAL_ID)
+                - No version tracking or historical preservation
+            
+            For facts (transactions):
                 - Simple append (no version tracking needed)
         
         Schema Enforcement:
@@ -617,6 +630,7 @@ def creditcardfraud_dag():
             return {"type": entity_type, "records": 0, "status": "skipped"}
         
         s3_key = parquet_keys[entity_type]
+        batch_id = parquet_keys.get("batch_id", "unknown_batch")  
         
         try:
             # Read DataFrame from Parquet intermediate storage
@@ -635,8 +649,9 @@ def creditcardfraud_dag():
             
             logging.info(f"Upserting {len(arrow_table)} records for entity: {entity_type}")
             
-            # Upsert to Iceberg with SCD2 logic (automatically applied for dimensions)
-            result = upsert_to_iceberg_with_scd2(entity_type, arrow_table)
+             # Upsert to Iceberg with SCD2 logic + batch idempotency
+            result = upsert_to_iceberg_with_scd2(entity_type, arrow_table, batch_id=batch_id)  
+        
             logging.info(f"Upserted {result.get('records', 0)} records for {entity_type} (status: {result.get('status')})")
             
             return result
@@ -681,8 +696,6 @@ def creditcardfraud_dag():
         parquet_keys = {k: v for k, v in parquet_keys_with_metadata.items() if k != "batch_id"}
         
         # Build list of successfully processed files
-        # In a real implementation, this would read file metadata from the DataFrames
-        # For now, we'll create a minimal structure for the archival process
         hook = S3Hook(aws_conn_id="minio_default")
         
         # Read metadata to get original file list
@@ -789,8 +802,9 @@ def creditcardfraud_dag():
         Responsibilities:
             - Serialize validated DataFrames to Parquet staging
             - Parallel upsert to Iceberg tables
-            - SCD2 dimension versioning
-            - Fact table append operations
+            - SCD2 dimension versioning (customers, travel_profiles)
+            - Static dimension updates (terminals)
+            - Fact table append operations (transactions)
         
         Returns:
             tuple: (parquet_keys_with_metadata, upsert_results)
@@ -798,7 +812,7 @@ def creditcardfraud_dag():
         # Serialize to Parquet staging area (avoid XCom limits)
         parquet_keys_with_metadata = serialize_to_parquet_staging(validated_dfs)
         
-        # Upsert each entity to Iceberg with SCD2 version control
+        # Upsert each entity to Iceberg with appropriate versioning strategy
         entities_to_upsert = ["customers", "terminals", "travel_profiles", "transactions"]
         upsert_results = [
             upsert_entity_to_iceberg(parquet_keys_with_metadata, entity) 
@@ -832,12 +846,12 @@ def creditcardfraud_dag():
     # Step 6: Validate data quality and schema compliance
     validated_dfs = validate_data_quality_and_schema(consolidated_dfs)
     
-    # Step 7: Persist to Iceberg with SCD2 version control
+    # Step 7: Persist to Iceberg with proper versioning strategy
     parquet_keys_with_metadata, upsert_results = persist_to_iceberg_with_scd2()
     
     # Step 8: Archive source files and cleanup staging artifacts
     archive_sources_and_cleanup_staging(parquet_keys_with_metadata, upsert_results)
 
 
-    # Instantiate the DAG for Airflow scheduler
+# Instantiate the DAG for Airflow scheduler
 dag_instance = creditcardfraud_dag()
